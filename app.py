@@ -41,9 +41,7 @@ PB_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.ya?ml$")
 PID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 USER_RE = re.compile(r"^[A-Za-z0-9._@\\$-]{1,64}$")
 GROUPS = ("linux", "windows")
-DEFAULT_LOCATIONS = [
-    {"name": "Standard", "nets": []},
-]
+DEFAULT_LOCATIONS = []  # Standorte legt man unter Einstellungen an
 LOCNAME_RE = re.compile(r"^[^<>\"'&/\\]{1,40}$")
 NET_RE = re.compile(r"^[0-9]{1,3}(\.[0-9]{1,3}){0,3}\.?$")
 
@@ -79,7 +77,7 @@ def locations():
     """Standorte in Anzeige-Reihenfolge: [{"name", "nets": [Netz-Praefixe]}]."""
     with LOCK:
         locs = load("locations.json", None)
-        if not locs:
+        if locs is None:
             locs = [dict(x) for x in DEFAULT_LOCATIONS]
             save("locations.json", locs)
         return locs
@@ -130,6 +128,8 @@ def pick_addresses(hs):
 def guess_location(h):
     """Standort aus Adresse bzw. Namen ableiten (fuer Maschinen ohne gesetzten Standort)."""
     locs = locations()
+    if not locs:
+        return ""
     addr = (addr_list(h) or [""])[0]
     text = (addr + " " + h.get("name", "")).lower()
     best = ""
@@ -171,10 +171,14 @@ def hosts():
             with open("/app/seed.json") as f:
                 h = json.load(f)["hosts"]
             save("hosts.json", h)
-        if any(not x.get("location") for x in h):
+        if any(not x.get("location") for x in h) and loc_names():
+            changed = False
             for x in h:
-                x["location"] = x.get("location") or guess_location(x)
-            save("hosts.json", h)
+                if not x.get("location"):
+                    x["location"] = guess_location(x)
+                    changed = changed or bool(x["location"])
+            if changed:
+                save("hosts.json", h)
         return sorted(h, key=lambda x: (loc_index(x.get("location")), not x.get("enabled", True), x["group"], display_name(x).lower()))
 
 
@@ -1247,7 +1251,7 @@ def schedule_loop():
 @login_required
 def machine(name=None):
     h = host(name) if name else {"name": "", "address": "", "group": "linux", "user": "root", "port": 22,
-                                 "enabled": True, "notes": "", "location": request.args.get("standort") or loc_names()[0]}
+                                 "enabled": True, "notes": "", "location": request.args.get("standort") or (loc_names() or [""])[0]}
     if request.method == "POST":
         if request.form.get("delete") and name:
             with LOCK:
@@ -1274,7 +1278,7 @@ def machine(name=None):
             "no_mass": bool(request.form.get("no_mass")),
             "notes": request.form.get("notes", "").strip()[:300],
             "profile": request.form.get("profile", ""),
-            "location": request.form.get("location") if request.form.get("location") in loc_names() else loc_names()[0],
+            "location": request.form.get("location", "") if request.form.get("location", "") in loc_names() + [""] else "",
         }
         err = None
         if not display and not request.form.get("name", "").strip():
@@ -1531,13 +1535,10 @@ def location_action(f):
                 locs[idx], locs[j] = locs[j], locs[idx]
                 save("locations.json", locs)
         elif act == "delete":
-            if len(locs) == 1:
-                flash("Der letzte Standort kann nicht gelöscht werden.", "err")
-                return
             hs = load("hosts.json", [])
             affected = [h for h in hs if h.get("location") == old]
             target = f.get("move_to", "")
-            if affected and (target not in names or target == old):
+            if affected and ((target and target not in names) or target == old):
                 flash(f"„{old}“ hat noch {len(affected)} Maschine(n) – bitte wählen, wohin sie verschoben werden.", "err")
                 return
             for h in affected:
@@ -1546,7 +1547,7 @@ def location_action(f):
                 save("hosts.json", hs)
             del locs[idx]
             save("locations.json", locs)
-            flash(f"Standort „{old}“ gelöscht" + (f", {len(affected)} Maschine(n) nach „{target}“ verschoben." if affected else "."), "ok")
+            flash(f"Standort „{old}“ gelöscht" + (f", {len(affected)} Maschine(n) " + (f"nach „{target}“ verschoben." if target else "jetzt ohne Standort.") if affected else "."), "ok")
 
 
 @app.route("/profil/neu", methods=["GET", "POST"])
@@ -1689,10 +1690,10 @@ LOGIN = """{% extends "base.html" %}{% block title %}Anmelden{% endblock %}{% bl
 INDEX = """{% extends "base.html" %}{% block title %}Maschinen{% endblock %}
 {% block head %}{% if running %}<script>setTimeout(function r(){if(document.querySelector('dialog[open]'))return setTimeout(r,5000);location.reload()},5000)</script>{% endif %}{% endblock %}
 {% block body %}<div class="fit"><h1>Maschinen <span class="mut small">({{ rows|length }})</span></h1>
-<div class="bar"><span class="mut small" style="width:70px">Standort</span>
+{% if locations %}<div class="bar"><span class="mut small" style="width:70px">Standort</span>
  <a class="btn {{ 'acc' if not loc }}" href="{{ qs(gruppe=grp, status=stat, updates=updf) }}">Alle</a>
  {% for l in locations %}<a class="btn {{ 'acc' if loc==l }}" href="{{ qs(gruppe=grp, standort=l, status=stat, updates=updf) }}">{{ l }} <span class="mut small">{{ counts[l] }}</span></a>{% endfor %}
-</div>
+</div>{% endif %}
 <div class="bar"><span class="mut small" style="width:70px">System</span>
  <a class="btn {{ 'acc' if not grp }}" href="{{ qs(standort=loc, status=stat, updates=updf) }}">Alle</a>
  {% for g in groups %}<a class="btn {{ 'acc' if grp==g }}" href="{{ qs(gruppe=g, standort=loc, status=stat, updates=updf) }}">{{ g|capitalize }}</a>{% endfor %}
@@ -1718,7 +1719,7 @@ INDEX = """{% extends "base.html" %}{% block title %}Maschinen{% endblock %}
 <div class="small mut" style="margin-bottom:8px">Maschinen mit offenen Updates{{ ' (aktueller Filter)' if (grp or loc or stat or updf) }} · ohne Neustart · <a href="#" onclick="updAll(true);return false">alle</a> · <a href="#" onclick="updAll(false);return false">keine</a></div>
 <div style="max-height:52vh;overflow:auto;border:1px solid var(--line);border-radius:8px"><table class="dlg">
 {% for r in upd_rows %}{% set u = r.st.upd %}<tr><td style="width:1%"><input type="checkbox" class="updh" name="host" value="{{ r.name }}" id="uh-{{ loop.index }}" {{ '' if r.no_mass else 'checked' }} onchange="updCount()"></td>
-<td><label for="uh-{{ loop.index }}" class="plain"><b>{{ r.display or r.name }}</b>{% if r.no_mass %} <span class="st-warn small">nur einzeln</span>{% endif %}</label><div class="mut small">&#128205; {{ r.location }}</div></td>
+<td><label for="uh-{{ loop.index }}" class="plain"><b>{{ r.display or r.name }}</b>{% if r.no_mass %} <span class="st-warn small">nur einzeln</span>{% endif %}</label>{% if r.location %}<div class="mut small">&#128205; {{ r.location }}</div>{% endif %}</td>
 <td><span class="tag {{ r.group }}">{{ r.group }}</span></td>
 <td class="small" style="white-space:nowrap"><span class="st-warn">{{ u.count }} Update{{ 's' if u.count != 1 }}</span>{% if u.security %}<div class="st-err">{{ u.security }} Sicherheit</div>{% endif %}</td></tr>{% endfor %}
 </table></div>
@@ -1743,7 +1744,7 @@ function updSubmit(f){var n=f.querySelectorAll('.updh:checked').length;if(!n)ret
 <table class="auto"><tr><th><select class="thsel{{ ' on' if stat }}" onchange="location=this.value" title="nach Status filtern">
  <option value="{{ qs(gruppe=grp, standort=loc, updates=updf) }}">Status: alle</option>
  {% for k, v in slabels.items() %}<option value="{{ qs(gruppe=grp, standort=loc, status=k, updates=updf) }}" {{ 'selected' if stat==k }}>{{ v }} ({{ scounts[k] }})</option>{% endfor %}
-</select></th><th>Name</th><th>Standort</th><th>Gruppe</th><th>Adresse</th><th style="min-width:230px">Betriebssystem</th><th style="white-space:nowrap;min-width:90px">CPU / RAM</th><th>Laufzeit</th><th><select class="thsel{{ ' on' if updf }}" onchange="location=this.value" title="nach Updates filtern">
+</select></th><th>Name</th>{% if locations %}<th>Standort</th>{% endif %}<th>Gruppe</th><th>Adresse</th><th style="min-width:230px">Betriebssystem</th><th style="white-space:nowrap;min-width:90px">CPU / RAM</th><th>Laufzeit</th><th><select class="thsel{{ ' on' if updf }}" onchange="location=this.value" title="nach Updates filtern">
  <option value="{{ qs(gruppe=grp, standort=loc, status=stat) }}">Updates: alle</option>
  {% for k, v in ulabels.items() %}<option value="{{ qs(gruppe=grp, standort=loc, status=stat, updates=k) }}" {{ 'selected' if updf==k }}>{{ v }} ({{ ucounts[k] }})</option>{% endfor %}
 </select></th><th style="white-space:nowrap">Letzter Kontakt</th><th>Aktionen</th></tr>
@@ -1752,7 +1753,7 @@ function updSubmit(f){var n=f.querySelectorAll('.updh:checked').length;if(!n)ret
  {% elif r.st.ping_time %}<span class="dot {{ 'ok' if r.st.ping_ok else 'err' }}"></span><span class="small {{ 'st-ok' if r.st.ping_ok else 'st-err' }}">{{ 'erreichbar' if r.st.ping_ok else 'Fehler' }}</span>
  {% else %}<span class="dot"></span><span class="mut small">unbekannt</span>{% endif %}</td>
 <td><a href="/maschine/{{ r.name }}"><b>{{ r.display or r.name }}</b></a>{% if r.notes %}<div class="mut small">{{ r.notes }}</div>{% endif %}</td>
-<td style="white-space:nowrap">&#128205; {{ r.location }}</td>
+{% if locations %}<td style="white-space:nowrap">{% if r.location %}&#128205; {{ r.location }}{% else %}<span class="mut">–</span>{% endif %}</td>{% endif %}
 <td><span class="tag {{ r.group }}">{{ r.group }}</span></td>
 <td>{% if not r.addrs %}–{% elif r.addrs|length == 1 %}{{ r.addrs[0] }}{% if r.port %}<span class="mut small">:{{ r.port }}</span>{% endif %}
  {% else %}{% set via = r.st.via %}{% for a in r.addrs %}<div class="{{ '' if via and via.ok and via.addr == a else 'mut small' }}">{{ a }}{% if loop.first and r.port %}<span class="mut small">:{{ r.port }}</span>{% endif %}{% if via and via.ok and via.addr == a %} <span class="st-ok small" title="zuletzt erreicht {{ via.time }}">&#10003; aktiv</span>{% endif %}</div>{% endfor %}
@@ -1782,7 +1783,7 @@ function updSubmit(f){var n=f.querySelectorAll('.updh:checked').length;if(!n)ret
 </table></div>{% endblock %}"""
 
 MACHINE = """{% extends "base.html" %}{% block title %}{{ (h.display or name) if name else 'Neue Maschine' }}{% endblock %}{% block body %}
-<h1>{{ (h.display or name) if name else 'Neue Maschine' }} {% if name %}{% if h.display %}<span class="mut small">{{ name }}</span> {% endif %}<span class="tag {{h.group}}">{{h.group}}</span> <span class="tag">&#128205; {{ h.location }}</span>{% endif %}</h1>
+<h1>{{ (h.display or name) if name else 'Neue Maschine' }} {% if name %}{% if h.display %}<span class="mut small">{{ name }}</span> {% endif %}<span class="tag {{h.group}}">{{h.group}}</span> {% if h.location %}<span class="tag">&#128205; {{ h.location }}</span>{% endif %}{% endif %}</h1>
 {% if name %}<div class="grid top">
 <div class="card"><h2 style="margin-top:0">Status</h2>
  {% if st.ping_time %}<span class="dot {{ 'ok' if st.ping_ok else 'err' }}"></span>{{ 'erreichbar' if st.ping_ok else st.ping_msg }}<div class="mut small">{{ st.ping_time }}</div>{% else %}<span class="mut">noch nie geprüft</span>{% endif %}
@@ -1823,7 +1824,7 @@ MACHINE = """{% extends "base.html" %}{% block title %}{{ (h.display or name) if
  <div><label>Technischer Name für Ansible {{ '' if name else '(leer = automatisch)' }}</label><input name="name" value="{{ h.name }}" placeholder="wird aus dem Anzeigenamen gebildet" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,62}" title="nur Buchstaben, Ziffern, Punkt, Minus, Unterstrich"></div>
  <div><label>Adresse(n) – IP oder DNS, mehrere mit Komma (z. B. LAN, WLAN)</label><input name="address" value="{{ h.address }}" placeholder="192.168.1.10, 192.168.1.11"></div>
  <div><label>Gruppe</label><select name="group">{% for g in groups %}<option {{ 'selected' if h.group==g }}>{{g}}</option>{% endfor %}</select></div>
- <div><label>Standort</label><select name="location">{% for l in locations %}<option {{ 'selected' if h.location==l }}>{{l}}</option>{% endfor %}</select></div>
+ <div><label>Standort</label><select name="location"><option value="" {{ 'selected' if not h.location }}>– kein Standort –</option>{% for l in locations %}<option {{ 'selected' if h.location==l }}>{{l}}</option>{% endfor %}</select></div>
  <div><label>Zugangsprofil</label><select name="profile"><option value="">Standard der Gruppe</option>
   {% for x in profiles.profiles %}<option value="{{x.id}}" {{ 'selected' if h.profile==x.id }}>{{ x.name }} ({{ x.type }})</option>{% endfor %}</select></div>
  <div><label>Benutzer (leer = aus dem Profil)</label><input name="user" value="{{ h.user }}"></div>
@@ -1905,7 +1906,7 @@ SETTINGS = """{% extends "base.html" %}{% block title %}Einstellungen{% endblock
 <input name="name" value="{{ l.name }}" style="flex:1"><input name="nets" value="{{ l.nets|join(', ') }}" style="flex:2" placeholder="z. B. 192.168.2."><button>Speichern</button></form></td>
 <td>{{ loc_count[l.name] or 0 }}</td>
 <td style="white-space:nowrap"><form method="post" style="display:flex;gap:6px" onsubmit="return confirm('Standort {{ l.name }} löschen?')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="form" value="location"><input type="hidden" name="act" value="delete"><input type="hidden" name="idx" value="{{i}}">
-{% if loc_count[l.name] %}<select name="move_to" style="width:180px;flex:none" title="Maschinen verschieben nach">{% for o in locs if o.name != l.name %}<option>{{ o.name }}</option>{% endfor %}</select>{% else %}<span style="width:180px;flex:none"></span>{% endif %}<button class="danger" style="min-width:190px">{{ 'Löschen + verschieben' if loc_count[l.name] else 'Löschen' }}</button></form></td></tr>{% endfor %}
+{% if loc_count[l.name] %}<select name="move_to" style="width:180px;flex:none" title="Maschinen verschieben nach">{% for o in locs if o.name != l.name %}<option>{{ o.name }}</option>{% endfor %}<option value="">– ohne Standort –</option></select>{% else %}<span style="width:180px;flex:none"></span>{% endif %}<button class="danger" style="min-width:190px">{{ 'Löschen + verschieben' if loc_count[l.name] else 'Löschen' }}</button></form></td></tr>{% endfor %}
 </table>
 <form method="post" style="margin-top:12px"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="form" value="location"><input type="hidden" name="act" value="add"><div class="grid">
 <div><label>Neuer Standort</label><input name="name" placeholder="z. B. Büro"></div>
