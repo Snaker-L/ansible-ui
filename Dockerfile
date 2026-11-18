@@ -7,7 +7,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # ansible 14.5.0 (Stand 2026-11-03, PyPI; bringt ansible-core 2.21.x mit); enthaelt ansible.windows / community.general
-RUN pip install --no-cache-dir ansible==14.5.0 pywinrm flask gunicorn pyyaml
+RUN pip install --no-cache-dir ansible==14.5.0 pywinrm flask gunicorn pyyaml ldap3==2.9.1
 
 WORKDIR /app
 COPY app.py seed.json entrypoint.sh /app/

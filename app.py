@@ -12,11 +12,15 @@ Daten (Volume /data):
   settings.json     Einstellungen (naechtliche Update-Pruefung)
 """
 import datetime
+import hashlib
 import json
 import os
 import re
 import secrets
+import smtplib
 import socket
+import ssl
+from email.message import EmailMessage
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
@@ -895,9 +899,13 @@ def login_required(fn):
     def wrapper(*a, **kw):
         if not session.get("user"):
             return redirect(url_for("login", next=request.path))
-        if not is_admin() and not cur_user():  # Benutzer wurde geloescht
-            session.clear()
-            return redirect(url_for("login"))
+        if not is_admin():
+            cu = cur_user()
+            if not cu:  # Benutzer wurde geloescht
+                session.clear()
+                return redirect(url_for("login"))
+            if cu.get("must_change") and cu.get("source") != "ad" and request.endpoint not in ("own_password", "logout"):
+                return redirect(url_for("own_password"))
         if request.method == "POST" and request.form.get("csrf") != session.get("csrf"):
             abort(400)
         return fn(*a, **kw)
@@ -947,7 +955,7 @@ def can_see(h, u=None):
     if not u:
         return False
     v = (u.get("perms") or {}).get(h.get("location") or "")
-    return v == "*" or (isinstance(v, list) and h["name"] in v)
+    return v == "*" or v == "group:" + h.get("group", "") or (isinstance(v, list) and h["name"] in v)
 
 
 def visible_hosts():
@@ -1037,12 +1045,23 @@ def rename_in_perms(kind, old, new):
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        un, pw = request.form.get("user", ""), request.form.get("password", "")
-        u = find_user(un) if un != ADMIN_USER else None
-        if u and check_password_hash(u["hash"], pw):
+        un, pw = request.form.get("user", "").strip(), request.form.get("password", "")
+        u = find_login(un) if un != ADMIN_USER else None
+        ok = False
+        if u and pw:
+            if u.get("source") == "ad":
+                ok, why = ad_authenticate(u, pw)
+                if not ok and why:
+                    app.logger.warning("AD-Anmeldung %s: %s", u["name"], why)
+            else:
+                ok = bool(u.get("hash")) and check_password_hash(u["hash"], pw)
+        if ok:
             session.clear()
             session.update(user=u["name"], role="user", csrf=secrets.token_hex(16))
             session.permanent = True
+            if u.get("must_change") and u.get("source") != "ad":
+                flash("Bitte jetzt ein eigenes Passwort festlegen.", "ok")
+                return redirect(url_for("own_password"))
             nxt = request.args.get("next", "/")
             return redirect(nxt if nxt.startswith("/") else "/")
         if un == ADMIN_USER and check_admin(pw):
@@ -1778,73 +1797,427 @@ def pw_problem(new, rep_):
 def perms_summary(u):
     out = []
     for loc, v in (u.get("perms") or {}).items():
-        out.append(f"{loc or 'ohne Standort'}: " + ("alle" if v == "*" else f"{len(v)} Maschine(n)"))
+        what = {"*": "alle", "group:linux": "alle Linux", "group:windows": "alle Windows"}.get(v) if isinstance(v, str) else f"{len(v)} Maschine(n)"
+        out.append(f"{loc or 'ohne Standort'}: {what}")
     return out
 
 
 @app.route("/benutzer")
 @admin_required
 def user_list():
-    return render_template("users.html", users=users_data(), summary=perms_summary)
+    return render_template("users.html", users=users_data(), summary=perms_summary, now_ts=time.time())
 
 
 @app.route("/benutzer/neu", methods=["GET", "POST"])
 @app.route("/benutzer/<uname>", methods=["GET", "POST"])
 @admin_required
 def user_edit(uname=None):
-    u = find_user(uname) if uname else {"name": "", "can_run": False, "perms": {}}
+    u = find_user(uname) if uname else {"name": "", "source": "local", "email": "", "can_run": False, "perms": {}}
     if u is None:
         abort(404)
     hs = hosts()
     locs = loc_names() + ([""] if any(not h.get("location") for h in hs) else [])
+
+    def store(name, **kw):
+        with LOCK:
+            us = users_data()
+            for x in us:
+                if x["name"] == name:
+                    x.update(kw)
+                    for k, v in kw.items():
+                        if v is None:
+                            x.pop(k, None)
+            save("users.json", us, 0o600)
+
     if request.method == "POST":
-        if request.form.get("delete") and uname:
+        act = request.form.get("act", "save")
+        if act == "delete" and uname:
             with LOCK:
                 save("users.json", [x for x in users_data() if x["name"] != uname], 0o600)
             flash(f"Benutzer {uname} gelöscht.", "ok")
             return redirect(url_for("user_list"))
+        if act == "resetpw" and uname and u.get("source") != "ad":  # Zufallspasswort, einmal anzeigen, beim Login aendern
+            pw = gen_password()
+            store(uname, hash=generate_password_hash(pw), must_change=True, invite=None, changed=now())
+            flash(f"Neues Passwort für {uname}: {pw}   – nur jetzt sichtbar; muss beim nächsten Login geändert werden.", "ok")
+            return redirect(url_for("user_edit", uname=uname))
+        if act in ("invite", "resetmail") and uname:
+            if not u.get("email"):
+                flash("Für diesen Benutzer ist keine E-Mail-Adresse eingetragen.", "err")
+                return redirect(url_for("user_edit", uname=uname))
+            try:
+                tok = None
+                if u.get("source") != "ad":
+                    tmp = dict(u)
+                    tok = make_invite(tmp)
+                    store(uname, invite=tmp["invite"])
+                invite_mail(u, tok)
+                flash(f"E-Mail an {u['email']} gesendet.", "ok")
+            except Exception as ex:  # noqa: BLE001
+                flash(f"E-Mail konnte nicht gesendet werden: {ex}", "err")
+            return redirect(url_for("user_edit", uname=uname))
         name = uname or request.form.get("name", "").strip()
+        email = request.form.get("email", "").strip()
         perms = {}
         for i, loc in enumerate(locs):
             mode = request.form.get(f"m{i}", "")
             if mode == "all":
                 perms[loc] = "*"
+            elif mode in ("linux", "windows"):
+                perms[loc] = "group:" + mode
             elif mode == "sel":
                 names = [x for x in request.form.getlist(f"h{i}")
                          if any(h["name"] == x and (h.get("location") or "") == loc for h in hs)]
                 if names:
                     perms[loc] = names
+        is_ad = u.get("source") == "ad"
         new_pw, rep_ = request.form.get("password", ""), request.form.get("password2", "")
+        send_inv = bool(request.form.get("send_invite")) and not uname
         err = None
-        if not uname and (not USERNAME_RE.match(name) or name == ADMIN_USER or find_user(name)):
+        if not uname and (not USERNAME_RE.match(name) or name == ADMIN_USER or find_user(name) or find_login(name)):
             err = "Benutzername ungültig oder schon vergeben (2–41 Zeichen: Buchstaben, Ziffern, . _ @ -)."
-        elif (new_pw or not uname) and pw_problem(new_pw, rep_):
+        elif email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+            err = "E-Mail-Adresse ungültig."
+        elif send_inv and not email:
+            err = "Für die Einladung wird eine E-Mail-Adresse gebraucht."
+        elif not is_ad and not send_inv and (new_pw or not uname) and pw_problem(new_pw, rep_):
             err = pw_problem(new_pw, rep_)
         if err:
             flash(err, "err")
-            return render_template("user.html", u={"name": name, "can_run": bool(request.form.get("can_run")), "perms": perms},
-                                   uname=uname, locs=locs, hs=hs)
+            return render_template("user.html", u={**u, "name": name, "email": email, "can_run": bool(request.form.get("can_run")),
+                                                    "perms": perms}, uname=uname, locs=locs, hs=hs)
         with LOCK:
             us = users_data()
             cur = next((x for x in us if x["name"] == name), None)
             if cur is None:
-                cur = {"name": name, "created": now()}
+                cur = {"name": name, "source": "local", "created": now()}
                 us.append(cur)
-            cur.update(can_run=bool(request.form.get("can_run")), perms=perms, changed=now())
-            if new_pw:
+            cur.update(can_run=bool(request.form.get("can_run")), perms=perms, email=email, changed=now())
+            if new_pw and not is_ad:
                 cur["hash"] = generate_password_hash(new_pw)
+                cur.pop("must_change", None)
+                if request.form.get("must_change"):
+                    cur["must_change"] = True
+            tok = make_invite(cur) if send_inv else None
             save("users.json", us, 0o600)
-        flash(f"Benutzer {name} gespeichert." + ("" if perms else " Achtung: noch keine Standorte freigegeben – sieht nichts."),
-              "ok" if perms else "err")
+        msg = f"Benutzer {name} gespeichert."
+        if send_inv:
+            try:
+                invite_mail(cur, tok)
+                msg += f" Einladung an {email} gesendet."
+            except Exception as ex:  # noqa: BLE001
+                flash(f"Benutzer angelegt, aber die Einladung konnte nicht gesendet werden: {ex}", "err")
+        if not perms:
+            flash(msg + " Achtung: noch keine Standorte freigegeben – sieht nichts.", "err")
+        else:
+            flash(msg, "ok")
         return redirect(url_for("user_edit", uname=name))
-    return render_template("user.html", u=u, uname=uname, locs=locs, hs=hs)
+    return render_template("user.html", u=u, uname=uname, locs=locs, hs=hs,
+                           mail_ok=bool(dir_conf()["mail"]["host"]), now_ts=time.time())
 
+
+# ---------------------------------------------------------------- E-Mail und Active Directory
+# directory.json (0600): {"mail": {...}, "ad": {...}}; Passwoerter darin im Klartext (wie secrets.json), nur im Daten-Volume.
+MAIL_DEFAULT = {"host": "", "port": 587, "security": "starttls", "user": "", "password": "", "sender": "", "base_url": ""}
+AD_DEFAULT = {"enabled": False, "servers": "", "port": 389, "security": "starttls", "verify": False, "base_dn": "",
+              "bind_user": "", "bind_password": "", "domain": "", "user_filter": ""}
+INVITE_HOURS = 72
+
+
+def dir_conf():
+    d = load("directory.json", {})
+    return {"mail": {**MAIL_DEFAULT, **(d.get("mail") or {})}, "ad": {**AD_DEFAULT, **(d.get("ad") or {})}}
+
+
+def base_url():
+    b = dir_conf()["mail"]["base_url"].strip().rstrip("/")
+    return b or (request.url_root.rstrip("/") if has_request_context() else "")
+
+
+def send_mail(to, subject, body):
+    m = dir_conf()["mail"]
+    if not m["host"] or not m["sender"]:
+        raise RuntimeError("E-Mail ist nicht eingerichtet (Benutzer › E-Mail & AD).")
+    msg = EmailMessage()
+    msg["From"], msg["To"], msg["Subject"] = m["sender"], to, subject
+    msg.set_content(body)
+    ctx = ssl.create_default_context()
+    port = int(m["port"] or 0)
+    if m["security"] == "ssl":
+        srv = smtplib.SMTP_SSL(m["host"], port or 465, timeout=20, context=ctx)
+    else:
+        srv = smtplib.SMTP(m["host"], port or 587, timeout=20)
+        if m["security"] == "starttls":
+            srv.starttls(context=ctx)
+    with srv:
+        if m["user"]:
+            srv.login(m["user"], m["password"])
+        srv.send_message(msg)
+
+
+def gen_password(n=16):
+    alpha = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    while True:
+        pw = "".join(secrets.choice(alpha + "!#%+-=?") for _ in range(n))
+        if re.search(r"[A-Z]", pw) and re.search(r"[a-z]", pw) and re.search(r"[0-9]", pw) and re.search(r"[!#%+\-=?]", pw):
+            return pw
+
+
+def make_invite(u):
+    t = secrets.token_urlsafe(32)
+    u["invite"] = {"hash": hashlib.sha256(t.encode()).hexdigest(), "expires": int(time.time()) + INVITE_HOURS * 3600}
+    return t
+
+
+def invite_mail(u, token=None):
+    """Einladung bzw. Passwort-Link (lokal) oder Zugangsinfo (AD) per E-Mail."""
+    url = base_url()
+    if u.get("source") == "ad":
+        body = (f"Hallo {u.get('display') or u['name']},\n\ndu hast jetzt Zugriff auf die Ansible-UI:\n{url}/\n\n"
+                f"Anmeldung mit deinem Domänen-Benutzer „{u['name']}“ und deinem gewohnten Windows-Passwort.\n")
+        subject = "Zugang zur Ansible-UI"
+    else:
+        body = (f"Hallo {u['name']},\n\nfür dich wurde ein Zugang zur Ansible-UI eingerichtet bzw. zurückgesetzt.\n"
+                f"Über diesen Link legst du dein Passwort fest (gültig {INVITE_HOURS} Stunden):\n\n{url}/einladung/{token}\n\n"
+                f"Benutzername: {u['name']}\n\nWenn du das nicht erwartet hast, kannst du diese E-Mail ignorieren.\n")
+        subject = "Einladung zur Ansible-UI"
+    send_mail(u["email"], subject, body)
+
+
+def find_login(name):
+    """Anmeldename -> Benutzer; AD-Benutzer ohne Gross-/Kleinschreibung und auch als DOMAENE\\name oder name@domain."""
+    u = find_user(name)
+    if u:
+        return u
+    short = name.split("\\")[-1].split("@")[0].lower()
+    return next((x for x in users_data() if x.get("source") == "ad" and x["name"].lower() == short), None)
+
+
+def _ldap():
+    import ldap3  # noqa: PLC0415 - nur noetig, wenn AD benutzt wird
+    return ldap3
+
+
+def ad_connection(conf, user=None, password=None):
+    """Verbindung zum ersten erreichbaren DC; Rueckgabe (conn, fehler)."""
+    ldap3 = _ldap()
+    hosts_ = [h.strip() for h in re.split(r"[,\s;]+", conf["servers"]) if h.strip()]
+    if not hosts_:
+        return None, "Kein Domänencontroller eingetragen."
+    tls = ldap3.Tls(validate=ssl.CERT_REQUIRED if conf["verify"] else ssl.CERT_NONE)
+    last = ""
+    for h in hosts_:
+        try:
+            srv = ldap3.Server(h, port=int(conf["port"] or (636 if conf["security"] == "ldaps" else 389)),
+                               use_ssl=conf["security"] == "ldaps", tls=tls, get_info=ldap3.NONE, connect_timeout=5)
+            c = ldap3.Connection(srv, user=user, password=password, receive_timeout=10, raise_exceptions=False,
+                                 authentication=ldap3.SIMPLE if user else ldap3.ANONYMOUS)
+            c.open()  # gibt nichts zurueck - Zustand ueber c.closed pruefen
+            if c.closed:
+                last = f"{h}: nicht erreichbar ({c.last_error or 'keine Verbindung'})"
+                continue
+            if conf["security"] == "starttls" and not c.start_tls():
+                last = f"{h}: StartTLS fehlgeschlagen ({c.result.get('description')})"
+                continue
+            if not c.bind():
+                return None, f"{h}: Anmeldung abgelehnt ({c.result.get('description')})"
+            return c, ""
+        except Exception as ex:  # noqa: BLE001
+            last = f"{h}: {ex}"
+    return None, last or "keine Verbindung"
+
+
+def ad_service():
+    conf = dir_conf()["ad"]
+    if not conf["enabled"]:
+        return None, "AD ist nicht aktiviert."
+    if not conf["bind_user"] or not conf["bind_password"]:
+        return None, "Dienstkonto (Benutzer/Passwort) fehlt."
+    return ad_connection(conf, conf["bind_user"], conf["bind_password"])
+
+
+AD_ATTRS = ["sAMAccountName", "displayName", "mail", "userPrincipalName", "distinguishedName", "userAccountControl"]
+
+
+def ad_entry(e):
+    a = e.entry_attributes_as_dict
+    one = lambda k: (a.get(k) or [""])[0]  # noqa: E731
+    return {"sam": str(one("sAMAccountName")), "display": str(one("displayName")), "mail": str(one("mail")),
+            "upn": str(one("userPrincipalName")), "dn": str(e.entry_dn),
+            "disabled": bool(int(one("userAccountControl") or 0) & 2)}
+
+
+def ad_filter(inner):
+    extra = dir_conf()["ad"]["user_filter"].strip()
+    if extra and not extra.startswith("("):
+        extra = f"({extra})"
+    return f"(&(objectCategory=person)(objectClass=user){inner}{extra})"
+
+
+def ad_search(q, limit=50):
+    c, err = ad_service()
+    if not c:
+        return [], err
+    esc = _ldap().utils.conv.escape_filter_chars(q.strip())
+    inner = f"(|(sAMAccountName=*{esc}*)(displayName=*{esc}*)(mail=*{esc}*))" if esc else "(sAMAccountName=*)"
+    try:
+        c.search(dir_conf()["ad"]["base_dn"], ad_filter(inner), attributes=AD_ATTRS, size_limit=limit)
+        return sorted((ad_entry(e) for e in c.entries), key=lambda x: (x["display"] or x["sam"]).lower()), ""
+    finally:
+        c.unbind()
+
+
+def ad_lookup(sam):
+    c, err = ad_service()
+    if not c:
+        return None, err
+    esc = _ldap().utils.conv.escape_filter_chars(sam)
+    try:
+        c.search(dir_conf()["ad"]["base_dn"], ad_filter(f"(sAMAccountName={esc})"), attributes=AD_ATTRS, size_limit=2)
+        return (ad_entry(c.entries[0]) if len(c.entries) == 1 else None), ("" if c.entries else "nicht gefunden (oder durch Filter ausgeschlossen)")
+    finally:
+        c.unbind()
+
+
+def ad_authenticate(u, pw):
+    """AD-Anmeldung: Konto per Dienstkonto suchen (aktuell, aktiv, Filter), dann mit seinem DN und Passwort binden."""
+    if not pw:  # leeres Passwort = anonymer Bind, wuerde "klappen"
+        return False, "leeres Passwort"
+    try:
+        e, err = ad_lookup(u["name"])
+        if not e:
+            return False, err
+        if e["disabled"]:
+            return False, "Konto im AD deaktiviert"
+        c, err = ad_connection(dir_conf()["ad"], e["dn"], pw)
+        if not c:
+            return False, err
+        c.unbind()
+        with LOCK:  # Anzeigename/E-Mail aktuell halten
+            us = users_data()
+            for x in us:
+                if x["name"] == u["name"]:
+                    x.update(ad_dn=e["dn"], display=e["display"] or x.get("display", ""), email=x.get("email") or e["mail"])
+            save("users.json", us, 0o600)
+        return True, ""
+    except Exception as ex:  # noqa: BLE001
+        return False, str(ex)
+
+
+@app.route("/benutzer/verzeichnis", methods=["GET", "POST"])
+@admin_required
+def directory_settings():
+    if request.method == "POST":
+        form = request.form.get("form")
+        d = load("directory.json", {})
+        if form == "mail":
+            m = {**MAIL_DEFAULT, **(d.get("mail") or {})}
+            for k in ("host", "user", "sender", "base_url"):
+                m[k] = request.form.get(k, "").strip()
+            m["port"] = int(request.form.get("port") or 0) or (465 if request.form.get("security") == "ssl" else 587)
+            m["security"] = request.form.get("security") if request.form.get("security") in ("starttls", "ssl", "none") else "starttls"
+            if request.form.get("password"):
+                m["password"] = request.form.get("password")
+            if request.form.get("clear_password"):
+                m["password"] = ""
+            d["mail"] = m
+            save("directory.json", d, 0o600)
+            flash("E-Mail-Einstellungen gespeichert.", "ok")
+            if request.form.get("test_to"):
+                try:
+                    send_mail(request.form["test_to"].strip(), "Ansible-UI: Test-E-Mail", "Die E-Mail-Einstellungen der Ansible-UI funktionieren.\n")
+                    flash(f"Test-E-Mail an {request.form['test_to'].strip()} gesendet.", "ok")
+                except Exception as ex:  # noqa: BLE001
+                    flash(f"Test-E-Mail fehlgeschlagen: {ex}", "err")
+            return redirect(url_for("directory_settings") + "#mail")
+        if form == "ad":
+            a = {**AD_DEFAULT, **(d.get("ad") or {})}
+            for k in ("servers", "base_dn", "bind_user", "domain", "user_filter"):
+                a[k] = request.form.get(k, "").strip()
+            a["security"] = request.form.get("security") if request.form.get("security") in ("starttls", "ldaps", "none") else "starttls"
+            a["port"] = int(request.form.get("port") or 0) or (636 if a["security"] == "ldaps" else 389)
+            a["verify"] = bool(request.form.get("verify"))
+            a["enabled"] = bool(request.form.get("enabled"))
+            if request.form.get("bind_password"):
+                a["bind_password"] = request.form.get("bind_password")
+            d["ad"] = a
+            save("directory.json", d, 0o600)
+            flash("AD-Einstellungen gespeichert.", "ok")
+            if request.form.get("test"):
+                try:
+                    found, err = ad_search("", limit=500)
+                    if err:
+                        flash(f"AD-Test fehlgeschlagen: {err}", "err")
+                    else:
+                        flash(f"AD-Verbindung ok – {len(found)} Benutzer gefunden (max. 500 gezählt).", "ok")
+                except Exception as ex:  # noqa: BLE001
+                    flash(f"AD-Test fehlgeschlagen: {ex}", "err")
+            return redirect(url_for("directory_settings") + "#ad")
+    c = dir_conf()
+    return render_template("directory.html", mail=c["mail"], ad=c["ad"])
+
+
+@app.route("/benutzer/ad", methods=["GET", "POST"])
+@admin_required
+def ad_add():
+    if request.method == "POST":
+        sam = request.form.get("sam", "")
+        e, err = ad_lookup(sam)
+        if not e:
+            flash(f"AD-Benutzer nicht übernommen: {err}", "err")
+            return redirect(url_for("ad_add", q=sam))
+        if e["sam"] == ADMIN_USER or find_user(e["sam"]) or find_login(e["sam"]):
+            flash(f"Einen Benutzer „{e['sam']}“ gibt es schon.", "err")
+            return redirect(url_for("ad_add", q=sam))
+        with LOCK:
+            us = users_data()
+            us.append({"name": e["sam"], "source": "ad", "display": e["display"], "email": e["mail"], "ad_dn": e["dn"],
+                       "can_run": False, "perms": {}, "created": now(), "changed": now()})
+            save("users.json", us, 0o600)
+        flash(f"AD-Benutzer {e['display'] or e['sam']} übernommen – jetzt die Rechte festlegen.", "ok")
+        return redirect(url_for("user_edit", uname=e["sam"]))
+    q = request.args.get("q", "")
+    res, err = ([], "")
+    if "q" in request.args:
+        try:
+            res, err = ad_search(q)
+        except Exception as ex:  # noqa: BLE001
+            err = str(ex)
+    have = {u["name"].lower() for u in users_data()}
+    return render_template("ad_add.html", q=q, res=res, err=err, have=have, conf=dir_conf()["ad"])
+
+
+@app.route("/einladung/<token>", methods=["GET", "POST"])
+def invite(token):
+    th = hashlib.sha256(token.encode()).hexdigest()
+    u = next((x for x in users_data() if (x.get("invite") or {}).get("hash") == th), None)
+    if not u or u["invite"]["expires"] < time.time():
+        return render_template("invite.html", u=None)
+    if request.method == "POST":
+        new, rep_ = request.form.get("new_password", ""), request.form.get("new_password2", "")
+        if pw_problem(new, rep_):
+            flash(pw_problem(new, rep_), "err")
+        else:
+            with LOCK:
+                us = users_data()
+                for x in us:
+                    if x["name"] == u["name"]:
+                        x["hash"], x["changed"] = generate_password_hash(new), now()
+                        x.pop("invite", None)
+                        x.pop("must_change", None)
+                save("users.json", us, 0o600)
+            flash("Passwort gespeichert – jetzt anmelden.", "ok")
+            return redirect(url_for("login"))
+    return render_template("invite.html", u=u)
 
 @app.route("/passwort", methods=["GET", "POST"])
 @login_required
 def own_password():
     if is_admin():
         return redirect(url_for("settings") + "#passwort")
+    if (cur_user() or {}).get("source") == "ad":
+        flash("Du meldest dich mit deinem Domänen-Konto an – das Passwort änderst du in Windows bzw. im AD.", "ok")
+        return redirect("/")
     if request.method == "POST":
         u = cur_user()
         old, new, rep_ = (request.form.get(k, "") for k in ("old_password", "new_password", "new_password2"))
@@ -1858,6 +2231,7 @@ def own_password():
                 for x in us:
                     if x["name"] == u["name"]:
                         x["hash"], x["changed"] = generate_password_hash(new), now()
+                        x.pop("must_change", None)
                 save("users.json", us, 0o600)
             flash("Passwort geändert.", "ok")
             return redirect("/")
@@ -2202,38 +2576,112 @@ document.getElementById('bpl').textContent=b.value=='su'?'Passwort des Zielbenut
 
 USERS = """{% extends "base.html" %}{% block title %}Benutzer{% endblock %}{% block body %}<div class="fit">
 <h1>Benutzer <span class="mut small">({{ users|length }})</span></h1>
+<div class="bar"><a class="btn acc" href="/benutzer/neu">+ Benutzer</a><a class="btn" href="/benutzer/ad">+ AD-Benutzer</a><span style="flex:1"></span><a class="btn" href="/benutzer/verzeichnis">&#9881; E-Mail &amp; AD</a></div>
 <p class="mut small">Der Admin <b>{{ session.user }}</b> sieht und darf alles. Benutzer sehen nur die freigegebenen Standorte bzw. Maschinen.</p>
-<table class="auto"><tr><th>Benutzer</th><th>Darf</th><th>Sieht</th><th>Geändert</th><th></th></tr>
-{% for u in users %}<tr><td><b>{{ u.name }}</b></td>
+<table class="auto"><tr><th>Benutzer</th><th>Anmeldung</th><th>Darf</th><th>Sieht</th><th>Geändert</th><th></th></tr>
+{% for u in users %}<tr><td><b>{{ u.display or u.name }}</b>{% if u.display %}<div class="mut small">{{ u.name }}</div>{% endif %}{% if u.email %}<div class="mut small">{{ u.email }}</div>{% endif %}</td>
+<td class="small">{% if u.source == 'ad' %}<span class="tag windows">AD</span>{% else %}<span class="tag">lokal</span>{% endif %}
+ {% if u.invite and u.invite.expires > now_ts %}<div class="st-warn">Einladung offen</div>{% elif u.source != 'ad' and not u.hash %}<div class="st-err">kein Passwort</div>{% elif u.must_change %}<div class="st-warn">muss Passwort ändern</div>{% endif %}</td>
 <td>{% if u.can_run %}<span class="st-ok">ansehen + bedienen</span>{% else %}<span class="mut">nur ansehen</span>{% endif %}</td>
 <td class="small">{% for x in summary(u) %}<div>&#128205; {{ x }}</div>{% else %}<span class="st-err">nichts freigegeben</span>{% endfor %}</td>
 <td class="small mut" style="white-space:nowrap">{{ (u.changed or u.created or '')[:16] }}</td>
 <td><a class="btn" href="/benutzer/{{ u.name }}">Bearbeiten</a></td></tr>
-{% else %}<tr><td colspan="5" class="mut">Noch keine Benutzer.</td></tr>{% endfor %}</table>
-<p><a class="btn acc" href="/benutzer/neu">+ Benutzer</a></p></div>{% endblock %}"""
+{% else %}<tr><td colspan="6" class="mut">Noch keine Benutzer.</td></tr>{% endfor %}</table></div>{% endblock %}"""
 
-USER = """{% extends "base.html" %}{% block title %}{{ uname or 'Neuer Benutzer' }}{% endblock %}{% block body %}<div class="fit" style="min-width:min(760px,100%)">
-<h1>{{ uname or 'Neuer Benutzer' }}</h1>
-<form method="post"><input type="hidden" name="csrf" value="{{csrf}}">
+USER = """{% extends "base.html" %}{% block title %}{{ uname or 'Neuer Benutzer' }}{% endblock %}{% block body %}<div class="fit" style="min-width:min(780px,100%)">
+<h1>{{ (u.display or uname) if uname else 'Neuer Benutzer' }} {% if u.source == 'ad' %}<span class="tag windows">AD</span>{% elif uname %}<span class="tag">lokal</span>{% endif %}</h1>
+<form method="post" id="uf"><input type="hidden" name="csrf" value="{{csrf}}">
 <div class="card"><h2 style="margin-top:0">Anmeldung</h2><div class="grid">
  <div><label>Benutzername</label><input name="name" value="{{ u.name }}" {{ 'disabled' if uname else 'required autofocus' }} pattern="[A-Za-z0-9][A-Za-z0-9._@\\-]{1,40}"></div>
- <div><label>{{ 'Neues Passwort (leer = unverändert)' if uname else 'Passwort' }}</label><input name="password" type="password" autocomplete="new-password" minlength="10" {{ '' if uname else 'required' }}></div>
- <div><label>Passwort wiederholen</label><input name="password2" type="password" autocomplete="new-password"></div>
-</div><div class="hint">mindestens 10 Zeichen</div>
+ <div><label>E-Mail{{ ' (aus dem AD)' if u.source == 'ad' }}</label><input name="email" type="email" value="{{ u.email or '' }}" placeholder="fuer Einladung / Passwort-Link"></div>
+</div>
+{% if u.source == 'ad' %}<p class="small mut">Meldet sich mit dem Domänen-Passwort an (geprüft per LDAP). {{ u.ad_dn or '' }}</p>
+{% else %}<div class="grid">
+ <div><label>{{ 'Neues Passwort (leer = unverändert)' if uname else 'Passwort' }}</label><input name="password" id="pw1" type="password" autocomplete="new-password" minlength="10"></div>
+ <div><label>Passwort wiederholen</label><input name="password2" id="pw2" type="password" autocomplete="new-password"></div>
+ <div><button type="button" onclick="genPw()">&#127922; Passwort erzeugen</button></div>
+</div><div class="hint">mindestens 10 Zeichen · ein erzeugtes Passwort wird angezeigt, damit du es weitergeben kannst</div>
+<label class="plain" style="display:block;margin-top:6px"><input type="checkbox" name="must_change" value="1" {{ 'checked' if not uname }}> beim ersten Login ändern lassen</label>
+{% if not uname %}<label class="plain" style="display:block;margin-top:6px"><input type="checkbox" name="send_invite" value="1" {{ '' if mail_ok else 'disabled' }} onchange="document.getElementById('pw1').required=false"> stattdessen per E-Mail einladen – der Benutzer legt sein Passwort selbst fest{% if not mail_ok %} <span class="mut small">(erst <a href="/benutzer/verzeichnis">E-Mail einrichten</a>)</span>{% endif %}</label>{% endif %}
+{% endif %}
 <label class="plain" style="display:block;margin-top:10px"><input type="checkbox" name="can_run" value="1" {{ 'checked' if u.can_run }}> darf bedienen: Ping, Info Device, Updates prüfen / installieren / planen, Neustart</label>
 <div class="hint">ohne Haken nur ansehen. Maschinen anlegen/bearbeiten, Playbooks, Einstellungen, Upgrades und Benutzer bleiben immer beim Admin.</div></div>
 <div class="card"><h2 style="margin-top:0">Was darf {{ uname or 'der Benutzer' }} sehen?</h2>
-<table class="dlg">{% for loc in locs %}{% set i = loop.index0 %}{% set v = u.perms.get(loc) %}{% set mode = 'all' if v == '*' else ('sel' if v else '') %}
-<tr><td style="width:30%"><b>&#128205; {{ loc or 'ohne Standort' }}</b><div class="mut small">{{ hs|selectattr('location', 'equalto', loc)|list|length if loc else hs|rejectattr('location')|list|length }} Maschine(n)</div></td>
+<table class="dlg">{% for loc in locs %}{% set i = loop.index0 %}{% set v = u.perms.get(loc) %}{% set mode = 'all' if v == '*' else ('linux' if v == 'group:linux' else ('windows' if v == 'group:windows' else ('sel' if v else ''))) %}
+{% set lh = hs|selectattr('location', 'equalto', loc)|list if loc else hs|rejectattr('location')|list %}
+<tr><td style="width:28%"><b>&#128205; {{ loc or 'ohne Standort' }}</b><div class="mut small">{{ lh|length }} Maschine(n): {{ lh|selectattr('group', 'equalto', 'linux')|list|length }} Linux · {{ lh|selectattr('group', 'equalto', 'windows')|list|length }} Windows</div></td>
 <td><select name="m{{i}}" style="width:auto" onchange="this.closest('td').querySelector('.hl').hidden = this.value != 'sel'">
- <option value="" {{ 'selected' if not mode }}>nichts</option><option value="all" {{ 'selected' if mode == 'all' }}>alle Maschinen (auch künftige)</option><option value="sel" {{ 'selected' if mode == 'sel' }}>nur ausgewählte</option></select>
- <div class="hl" {{ '' if mode == 'sel' else 'hidden' }} style="margin-top:6px">{% for h in hs if (h.location or '') == loc %}
- <label class="plain" style="display:block"><input type="checkbox" name="h{{i}}" value="{{ h.name }}" {{ 'checked' if v and v != '*' and h.name in v }}> {{ h.display or h.name }} <span class="tag {{ h.group }}">{{ h.group }}</span>{% if not h.enabled %} <span class="mut small">inaktiv</span>{% endif %}</label>
- {% else %}<span class="mut small">keine Maschinen</span>{% endfor %}</div></td></tr>
+ <option value="" {{ 'selected' if not mode }}>nichts</option><option value="all" {{ 'selected' if mode == 'all' }}>alle Maschinen</option>
+ <option value="linux" {{ 'selected' if mode == 'linux' }}>alle Linux-Maschinen</option><option value="windows" {{ 'selected' if mode == 'windows' }}>alle Windows-Maschinen</option>
+ <option value="sel" {{ 'selected' if mode == 'sel' }}>nur ausgewählte</option></select>
+ <span class="mut small">„alle …“ gilt auch für künftige Maschinen</span>
+ <div class="hl" {{ '' if mode == 'sel' else 'hidden' }} style="margin-top:6px"><div class="small" style="margin-bottom:4px">Anhaken: <a href="#" onclick="return tick(this,'linux')">alle Linux</a> · <a href="#" onclick="return tick(this,'windows')">alle Windows</a> · <a href="#" onclick="return tick(this,'*')">alle</a> · <a href="#" onclick="return tick(this,'')">keine</a></div>
+ {% for g in groups %}{% set gh = lh|selectattr('group', 'equalto', g)|list %}{% if gh %}<div class="mut small" style="margin-top:4px;text-transform:uppercase">{{ g }}</div>{% for h in gh %}
+ <label class="plain" style="display:block"><input type="checkbox" name="h{{i}}" value="{{ h.name }}" data-g="{{ h.group }}" {{ 'checked' if v and v is not string and h.name in v }}> {{ h.display or h.name }} <span class="tag {{ h.group }}">{{ h.group }}</span>{% if not h.enabled %} <span class="mut small">inaktiv</span>{% endif %}</label>
+ {% endfor %}{% endif %}{% endfor %}{% if not lh %}<span class="mut small">keine Maschinen</span>{% endif %}</div></td></tr>
 {% else %}<tr><td class="mut">Noch keine Standorte – unter Einstellungen anlegen.</td></tr>{% endfor %}</table></div>
 <p><button class="acc">Speichern</button> <a class="btn" href="/benutzer">Zurück</a></p></form>
-{% if uname %}<form method="post" onsubmit="return confirm('Benutzer {{ uname }} wirklich löschen?')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="delete" value="1"><button class="danger">Benutzer löschen</button></form>{% endif %}
-</div>{% endblock %}"""
+{% if uname %}<div class="card"><h2 style="margin-top:0">{{ 'Zugang' if u.source == 'ad' else 'Passwort zurücksetzen / einladen' }}</h2><div class="bar" style="margin:0">
+{% if u.source != 'ad' %}<form class="inl" method="post" onsubmit="return confirm('Neues Zufallspasswort für {{ uname }} erzeugen? Das alte gilt dann nicht mehr.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="act" value="resetpw"><button>&#127922; Zufallspasswort setzen</button></form>{% endif %}
+<form class="inl" method="post"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="act" value="{{ 'invite' if u.source == 'ad' else 'resetmail' }}"><button {{ '' if (mail_ok and u.email) else 'disabled' }}>&#9993; {{ 'Zugangsinfo per E-Mail' if u.source == 'ad' else 'Link zum Passwort-Festlegen per E-Mail' }}</button></form>
+</div><div class="hint">{% if not mail_ok %}E-Mail noch nicht eingerichtet – <a href="/benutzer/verzeichnis">E-Mail &amp; AD</a>{% elif not u.email %}keine E-Mail-Adresse eingetragen{% elif u.source != 'ad' %}Der Link gilt 72 Stunden; das Zufallspasswort wird einmal angezeigt und muss beim nächsten Login geändert werden.{% endif %}</div></div>
+<form method="post" onsubmit="return confirm('Benutzer {{ uname }} wirklich löschen?')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="act" value="delete"><button class="danger">Benutzer löschen</button></form>{% endif %}
+</div>
+<script>
+function tick(a,g){a.closest('.hl').querySelectorAll('input[type=checkbox]').forEach(function(c){c.checked = g==='*' || (g!=='' && c.dataset.g===g)});return false}
+function genPw(){var al='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!#%+-=?',pw='',r=new Uint32Array(16);
+ do{crypto.getRandomValues(r);pw='';for(var i=0;i<16;i++)pw+=al[r[i]%al.length]}while(!(/[A-Z]/.test(pw)&&/[a-z]/.test(pw)&&/[0-9]/.test(pw)&&/[!#%+\\-=?]/.test(pw)));
+ ['pw1','pw2'].forEach(function(id){var e=document.getElementById(id);e.value=pw;e.type='text'})}
+</script>{% endblock %}"""
+
+DIRECTORY = """{% extends "base.html" %}{% block title %}E-Mail & AD{% endblock %}{% block body %}<div class="fit" style="min-width:min(780px,100%)">
+<h1>E-Mail &amp; Active Directory</h1>
+<form method="post" class="card" id="mail"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="form" value="mail">
+<h2 style="margin-top:0">E-Mail-Versand (Einladungen, Passwort-Links)</h2><div class="grid">
+ <div><label>SMTP-Server</label><input name="host" value="{{ mail.host }}" placeholder="mail.example.com"></div>
+ <div><label>Verschlüsselung</label><select name="security">{% for k, v in [('starttls','STARTTLS (587)'),('ssl','SSL/TLS (465)'),('none','keine')] %}<option value="{{k}}" {{ 'selected' if mail.security==k }}>{{v}}</option>{% endfor %}</select></div>
+ <div><label>Port</label><input name="port" type="number" value="{{ mail.port }}"></div>
+ <div><label>Benutzer (leer = ohne Anmeldung)</label><input name="user" value="{{ mail.user }}" autocomplete="off"></div>
+ <div><label>Passwort {{ '(gespeichert – leer = unverändert)' if mail.password }}</label><input name="password" type="password" autocomplete="new-password"></div>
+ <div><label>Absender</label><input name="sender" value="{{ mail.sender }}" placeholder="Ansible-UI &lt;ansible@example.com&gt;"></div>
+ <div><label>Adresse der Ansible-UI (für Links)</label><input name="base_url" value="{{ mail.base_url }}" placeholder="https://ansible.example.com"></div>
+ <div><label>Test-E-Mail an (optional)</label><input name="test_to" type="email" placeholder="du@example.com"></div>
+</div>{% if mail.password %}<label class="plain" style="display:block;margin-top:6px"><input type="checkbox" name="clear_password" value="1"> gespeichertes Passwort löschen</label>{% endif %}
+<p><button class="acc">Speichern</button> <span class="mut small">mit Test-Adresse wird gleich eine Test-E-Mail geschickt</span></p></form>
+<form method="post" class="card" id="ad"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="form" value="ad">
+<h2 style="margin-top:0">Active Directory (Anmeldung mit Domänen-Konto)</h2>
+<label class="plain" style="display:block;margin-bottom:6px"><input type="checkbox" name="enabled" value="1" {{ 'checked' if ad.enabled }}> AD-Anmeldung aktiv</label><div class="grid">
+ <div><label>Domänencontroller (mehrere mit Komma)</label><input name="servers" value="{{ ad.servers }}" placeholder="dc1.example.local, dc2.example.local"></div>
+ <div><label>Verbindung</label><select name="security">{% for k, v in [('starttls','LDAP + StartTLS (389)'),('ldaps','LDAPS (636)'),('none','LDAP unverschlüsselt (389)')] %}<option value="{{k}}" {{ 'selected' if ad.security==k }}>{{v}}</option>{% endfor %}</select></div>
+ <div><label>Port</label><input name="port" type="number" value="{{ ad.port }}"></div>
+ <div><label>Basis-DN</label><input name="base_dn" value="{{ ad.base_dn }}" placeholder="DC=example,DC=local"></div>
+ <div><label>Dienstkonto (zum Suchen)</label><input name="bind_user" value="{{ ad.bind_user }}" placeholder="svc-ansible@example.local" autocomplete="off"></div>
+ <div><label>Passwort Dienstkonto {{ '(gespeichert – leer = unverändert)' if ad.bind_password }}</label><input name="bind_password" type="password" autocomplete="new-password"></div>
+ <div><label>Zusätzlicher Filter (optional)</label><input name="user_filter" value="{{ ad.user_filter }}" placeholder="memberOf=CN=Ansible-Benutzer,OU=Gruppen,DC=example,DC=local"></div>
+ <div><label>Domäne (Anzeige, optional)</label><input name="domain" value="{{ ad.domain }}" placeholder="EXAMPLE"></div>
+</div><label class="plain" style="display:block;margin-top:6px"><input type="checkbox" name="verify" value="1" {{ 'checked' if ad.verify }}> Zertifikat des DCs prüfen (nur mit vertrauenswürdigem Zertifikat)</label>
+<div class="hint">Unverschlüsselt würde das Passwort im Klartext übers Netz gehen – besser StartTLS oder LDAPS.</div>
+<p><button class="acc">Speichern</button> <button name="test" value="1">Speichern + Verbindung testen</button></p></form>
+<p><a class="btn" href="/benutzer">Zurück zu den Benutzern</a></p></div>{% endblock %}"""
+
+AD_ADD = """{% extends "base.html" %}{% block title %}AD-Benutzer hinzufügen{% endblock %}{% block body %}<div class="fit" style="min-width:min(780px,100%)">
+<h1>AD-Benutzer hinzufügen</h1>
+{% if not conf.enabled %}<div class="flash err">AD ist noch nicht eingerichtet bzw. nicht aktiv – <a href="/benutzer/verzeichnis#ad">E-Mail &amp; AD</a>.</div>{% endif %}
+<form method="get" class="bar"><input name="q" value="{{ q }}" placeholder="Name, Anmeldename oder E-Mail" style="width:320px" autofocus><button class="acc">Suchen</button></form>
+{% if err %}<div class="flash err">{{ err }}</div>{% endif %}
+{% if res %}<table class="auto"><tr><th>Name</th><th>Anmeldename</th><th>E-Mail</th><th></th></tr>
+{% for e in res %}<tr class="{{ 'off' if e.disabled }}"><td>{{ e.display or '–' }}{% if e.disabled %} <span class="mut small">(deaktiviert)</span>{% endif %}</td><td>{{ e.sam }}</td><td class="small">{{ e.mail or '–' }}</td>
+<td>{% if e.sam|lower in have %}<span class="mut small">schon vorhanden</span>{% elif not e.disabled %}<form method="post" class="inl"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="sam" value="{{ e.sam }}"><button>Hinzufügen</button></form>{% endif %}</td></tr>{% endfor %}</table>
+{% if res|length >= 50 %}<p class="mut small">Nur die ersten 50 Treffer – Suche genauer eingrenzen.</p>{% endif %}
+{% elif q is defined and request.args.get('q') is not none and not err %}<p class="mut">Keine Treffer.</p>{% endif %}
+<p><a class="btn" href="/benutzer">Zurück</a></p></div>{% endblock %}"""
+
+INVITE = """{% extends "base.html" %}{% block title %}Passwort festlegen{% endblock %}{% block body %}
+<div class="card" style="max-width:420px;margin:60px auto"><h1>Ansible-UI</h1>{% if not u %}<p class="st-err">Dieser Link ist ungültig oder abgelaufen.</p><p class="mut">Bitte beim Admin einen neuen anfordern.</p><p><a class="btn" href="/login">Zur Anmeldung</a></p>
+{% else %}<p>Passwort festlegen für <b>{{ u.name }}</b></p><form method="post">
+<label>Neues Passwort (mind. 10 Zeichen)</label><input name="new_password" type="password" autocomplete="new-password" minlength="10" required autofocus>
+<label>Wiederholen</label><input name="new_password2" type="password" autocomplete="new-password" required>
+<p><button class="acc">Speichern</button></p></form>{% endif %}</div>{% endblock %}"""
 
 PASSWORD = """{% extends "base.html" %}{% block title %}Passwort{% endblock %}{% block body %}
 <div class="card" style="max-width:420px;margin:30px auto"><h1>Passwort ändern</h1><form method="post"><input type="hidden" name="csrf" value="{{csrf}}">
@@ -2246,7 +2694,7 @@ FORBIDDEN = """{% extends "base.html" %}{% block title %}Keine Berechtigung{% en
 <div class="card" style="max-width:480px;margin:40px auto"><h1>Keine Berechtigung</h1><p class="mut">Dafür fehlen dir die Rechte. Wende dich an den Admin.</p>
 <p><a class="btn acc" href="/">Zur Maschinenliste</a></p></div>{% endblock %}"""
 
-app.jinja_loader = DictLoader({"users.html": USERS, "user.html": USER, "password.html": PASSWORD, "forbidden.html": FORBIDDEN, "base.html": BASE, "login.html": LOGIN, "index.html": INDEX, "machine.html": MACHINE,
+app.jinja_loader = DictLoader({"directory.html": DIRECTORY, "ad_add.html": AD_ADD, "invite.html": INVITE, "users.html": USERS, "user.html": USER, "password.html": PASSWORD, "forbidden.html": FORBIDDEN, "base.html": BASE, "login.html": LOGIN, "index.html": INDEX, "machine.html": MACHINE,
                                "playbooks.html": PLAYBOOKS, "runs.html": RUNS, "run.html": RUN, "settings.html": SETTINGS,
                                "profile.html": PROFILE})
 
