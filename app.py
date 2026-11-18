@@ -1029,7 +1029,7 @@ def cur_user():
 
 
 # Rechte fuer Aktionen (pro Benutzer und/oder Benutzergruppe; wirksam = Vereinigung)
-ACTIONS = {"ping": "Ping", "facts": "Info Device", "upd_check": "Updates prüfen (auch Probelauf)",
+ACTIONS = {"ping": "Ping", "facts": "Info Device", "upd_check": "Updates prüfen und Update Check",
            "upd_install": "Updates installieren", "plan": "Updates / Neustarts planen", "reboot": "Neustart"}
 
 
@@ -1248,7 +1248,7 @@ def index():
             settled = later and not u.get("count")
         if last and last["status"] not in ("ok",) and not settled:
             r["lastfail"] = {"id": last["id"], "what": {"upgrade": "Upgrade", "reboot": "Neustart"}.get(
-                                 last["kind"], "Check" if "Probelauf" in last["title"] else "Update"),
+                                 last["kind"], "Update Check" if "Probelauf" in last["title"] else "Update"),
                              "time": (last.get("end") or last["start"])[11:16], "why": run_reason(last["id"], r["name"]),
                              "verb": "abgebrochen" if last["status"] == "abgebrochen" else "fehlgeschlagen"}
     for r in rows:  # laufende Aktion je Maschine (Ziel = Name, Namensliste, Gruppe oder "all")
@@ -1256,7 +1256,7 @@ def index():
             t = set(str(x.get("target", "")).split(","))
             if t & {r["name"], r["group"], "all"}:
                 if x["kind"] == "playbook":
-                    what = "Check läuft" if "Probelauf" in x["title"] else "Update läuft"
+                    what = "Update Check läuft" if "Probelauf" in x["title"] else "Update läuft"
                 else:
                     what = {"updates": "Prüfung läuft", "ping": "Ping läuft", "facts": "Info Device läuft", "reboot": "Neustart läuft", "upgrade": "Upgrade läuft"}.get(x["kind"], "läuft")
                 r["run"] = {"id": x["id"], "what": what, "start": x["start"]}
@@ -1457,7 +1457,7 @@ def launch_mass(kind, sel, label):
         names = [h["name"] for h in sel if h["group"] == g]
         if not names or pb not in playbooks():
             continue
-        title = f"{'Check' if kind == 'check' else 'Update'} {g} ({label}): {len(names)} Maschine(n)"
+        title = f"{'Update Check' if kind == 'check' else 'Update'} {g} ({label}): {len(names)} Maschine(n)"
         rid = new_run("playbook", ",".join(names), title + (" (Probelauf)" if kind == "check" else ""), names)
         start(playbook_job, rid, pb, ",".join(names), kind == "check")
         started.append(f"{g}: {len(names)}")
@@ -2576,7 +2576,7 @@ INDEX = """{% extends "base.html" %}{% block title %}Maschinen{% endblock %}
  {% if can.upd_check %}<form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}">
   <input type="hidden" name="kind" value="updates"><input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button title="sucht nur, installiert nichts">Updates {{ 'aller' if not (grp or loc or stat or updf) else 'der Auswahl' }} prüfen</button></form>
  <form class="inl" method="post" action="/massen"><input type="hidden" name="csrf" value="{{csrf}}">
-  <input type="hidden" name="kind" value="check"><input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button title="Probelauf der Update-Playbooks – installiert nichts">Check {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }}</button></form>
+  <input type="hidden" name="kind" value="check"><input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button title="Probelauf der Update-Playbooks – installiert nichts">Update Check {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }}</button></form>
  {% endif %}{% if can.upd_install %}<button type="button" class="acc" {{ 'disabled' if not upd_rows }} title="Maschinen auswählen, sofort oder geplant" onclick="document.getElementById('dlg-upd').showModal();updCount()">Update {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }} ({{ n_upd }})</button>
  {% endif %}{% if reboot_rows and can.reboot %}<button type="button" class="danger" title="Reihenfolge festlegen – streng nacheinander" onclick="document.getElementById('dlg-rb').showModal();rbUpd()">Neustart {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }} ({{ n_reboot }})</button>{% endif %}
  {% if admin %}<a class="btn acc" href="/maschine/neu{{ ('?standort=' ~ loc) if loc }}">+ Maschine</a>{% endif %}
@@ -2675,7 +2675,7 @@ function updSubmit(f){var n=f.querySelectorAll('.updh:checked').length;if(!n)ret
  {% if u %}<div class="mut" title="{{ u.stale or '' }}">{{ u.time[:16] }}{% if u.stale %} *{% endif %}</div>{% endif %}
 </div>
  {% set pb = 'updates-installieren-' ~ r.group ~ '.yml' %}{% if r.enabled and r.address and pb in pbs and (can.upd_check or can.upd_install or can.reboot) %}
- <div style="white-space:nowrap;text-align:center"><div><form class="inl" method="post" action="/playbook/start"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="playbook" value="{{ pb }}"><input type="hidden" name="target" value="{{ r.name }}"><input type="hidden" name="check" value="1"><button title="Probelauf: zeigt, was installiert würde" {{ '' if can.upd_check else 'hidden' }}>Check</button></form>
+ <div style="white-space:nowrap;text-align:center"><div><form class="inl" method="post" action="/playbook/start"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="playbook" value="{{ pb }}"><input type="hidden" name="target" value="{{ r.name }}"><input type="hidden" name="check" value="1"><button title="Probelauf: zeigt, was installiert würde" {{ '' if can.upd_check else 'hidden' }}>Update Check</button></form>
  {% if u and u.ok and u.count and can.upd_install %}<form class="inl" method="post" action="/playbook/start" onsubmit="return confirm('{{ u.count }} Update(s) auf {{ r.display or r.name }} jetzt installieren?{{ ' (Windows: kann dauern, Programme vorher schließen)' if r.group == 'windows' }}')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="playbook" value="{{ pb }}"><input type="hidden" name="target" value="{{ r.name }}"><button class="acc" title="Updates installieren (ohne Neustart)">Update</button></form>{% endif %}
  {% if u and u.reboot and can.reboot %}<form class="inl" method="post" action="/neustart" onsubmit="return confirm('{{ r.display or r.name }} jetzt neu starten?{{ ' ACHTUNG: Docker-Host bzw. nur-einzeln-Maschine – dabei sind alle Dienste darauf weg, auch diese Seite.' if r.no_mass }}')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ r.name }}"><button class="danger" title="Maschine neu starten">Neustart</button></form>{% endif %}
  {% if admin and u and u.release and u.release.new and r.group == 'linux' and 'pve' not in (r.sum.kernel or '') %}<form class="inl" method="post" action="/upgrade" onsubmit="return confirm('Distributions-Upgrade von {{ r.display or r.name }} auf {{ u.release.new }} starten?\\n\\nVORHER einen Snapshot bzw. ein Backup machen!\\nDauert 20–60 Minuten, die Maschine startet dabei neu und ist zeitweise nicht erreichbar.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ r.name }}"><button style="background:#1f3b63;border-color:#2f5b93" title="auf {{ u.release.new }} aktualisieren">Upgrade</button></form>{% endif %}</div>{% if r.no_mass %}<div class="mut" title="wird bei „Update alle“ ausgelassen">nur einzeln</div>{% endif %}</div>{% endif %}</div></td>

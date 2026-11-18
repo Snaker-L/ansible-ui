@@ -17,7 +17,7 @@ gedacht für Heimnetz und kleine Umgebungen mit Linux- und Windows-Rechnern.
 - Distributions-Upgrade (Debian/Ubuntu)
 - Playbook-Editor und Läufe mit vollständigem Log
 - Benutzer und Benutzergruppen: der Admin gibt Standorte frei – ganz oder nur ausgewählte Maschinen – und legt die
-  Rechte einzeln fest (Ping, Info Device, Updates prüfen, Updates installieren, Planen, Neustart); ein Benutzer darf
+  Rechte einzeln fest (Ping, Info Device, Updates prüfen und Update Check, Updates installieren, Planen, Neustart); ein Benutzer darf
   alles, was seine Gruppen und seine eigenen Einstellungen zusammen erlauben. Maschinen, Playbooks, Einstellungen und
   Upgrades bleiben beim Admin. Rechte pro Standort auch als „alle Linux“ / „alle Windows“
 - Benutzer per E-Mail einladen (Link zum Passwort-Festlegen, 72 h), Passwort erzeugen oder zurücksetzen
