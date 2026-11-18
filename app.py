@@ -970,9 +970,9 @@ def login_required(fn):
 @app.context_processor
 def ctx():
     if not session.get("user"):
-        return {"csrf": "", "groups": GROUPS, "locations": [], "admin": False, "can_run": False}
+        return {"csrf": "", "groups": GROUPS, "locations": [], "admin": False, "can_run": False, "can": {k: False for k in ACTIONS}}
     return {"csrf": session.get("csrf", ""), "groups": GROUPS, "locations": visible_locs(), "admin": is_admin(),
-            "can_run": can_run()}
+            "can_run": can_run(), "can": can_map()}
 
 
 def check_admin(pw):
@@ -1002,6 +1002,39 @@ def cur_user():
     return None if is_admin() else find_user(session.get("user", ""))
 
 
+# Rechte fuer Aktionen (pro Benutzer und/oder Benutzergruppe; wirksam = Vereinigung)
+ACTIONS = {"ping": "Ping", "facts": "Info Device", "upd_check": "Updates prüfen (auch Probelauf)",
+           "upd_install": "Updates installieren", "plan": "Updates / Neustarts planen", "reboot": "Neustart"}
+
+
+def groups_data():
+    """groups.json: [{"id", "name", "actions": [...], "perms": {...}, "created", "changed"}]"""
+    return load("groups.json", [])
+
+
+def user_groups(u):
+    ids = set(u.get("groups") or [])
+    return [g for g in groups_data() if g["id"] in ids]
+
+
+def own_actions(u):
+    if "actions" in u:
+        return set(u.get("actions") or [])
+    return set(ACTIONS) if u.get("can_run") else set()  # aeltere Eintraege: "darf bedienen"
+
+
+def eff_actions(u):
+    out = own_actions(u)
+    for g in user_groups(u):
+        out |= set(g.get("actions") or [])
+    return out & set(ACTIONS)
+
+
+def perm_allows(perms, h):
+    v = (perms or {}).get(h.get("location") or "")
+    return v == "*" or v == "group:" + h.get("group", "") or (isinstance(v, list) and h["name"] in v)
+
+
 def can_see(h, u=None):
     if u is None:
         if is_admin():
@@ -1009,8 +1042,7 @@ def can_see(h, u=None):
         u = cur_user()
     if not u:
         return False
-    v = (u.get("perms") or {}).get(h.get("location") or "")
-    return v == "*" or v == "group:" + h.get("group", "") or (isinstance(v, list) and h["name"] in v)
+    return perm_allows(u.get("perms"), h) or any(perm_allows(g.get("perms"), h) for g in user_groups(u))
 
 
 def visible_hosts():
@@ -1028,8 +1060,20 @@ def visible_locs():
     return [x for x in loc_names() if x in names]
 
 
+def can_do(action):
+    return is_admin() or action in eff_actions(cur_user() or {})
+
+
+def can_map():
+    if is_admin():
+        return {k: True for k in ACTIONS}
+    eff = eff_actions(cur_user() or {})
+    return {k: k in eff for k in ACTIONS}
+
+
 def can_run():
-    return is_admin() or bool((cur_user() or {}).get("can_run"))
+    """Irgendeine Aktion erlaubt (Grundvoraussetzung fuer die Aktions-Routen; Details prueft can_do)."""
+    return is_admin() or bool(eff_actions(cur_user() or {}))
 
 
 def run_hosts(r):
@@ -1076,25 +1120,26 @@ def run_required(fn):
 
 
 def rename_in_perms(kind, old, new):
-    """Standort/Maschine umbenannt (new) oder geloescht (new=None): Rechte der Benutzer nachziehen."""
-    with LOCK:
-        us = users_data()
-        changed = False
-        for u in us:
-            pm = u.get("perms") or {}
-            if kind == "location" and old in pm:
-                v = pm.pop(old)
-                if new is not None:
-                    pm[new] = v
-                changed = True
-            elif kind == "host":
-                for k, v in pm.items():
-                    if isinstance(v, list) and old in v:
-                        pm[k] = [x for x in v if x != old] + ([new] if new else [])
-                        changed = True
-            u["perms"] = pm
-        if changed:
-            save("users.json", us, 0o600)
+    """Standort/Maschine umbenannt (new) oder geloescht (new=None): Rechte der Benutzer und Gruppen nachziehen."""
+    for fn in ("users.json", "groups.json"):
+        with LOCK:
+            items = load(fn, [])
+            changed = False
+            for u in items:
+                pm = u.get("perms") or {}
+                if kind == "location" and old in pm:
+                    v = pm.pop(old)
+                    if new is not None:
+                        pm[new] = v
+                    changed = True
+                elif kind == "host":
+                    for k, v in pm.items():
+                        if isinstance(v, list) and old in v:
+                            pm[k] = [x for x in v if x != old] + ([new] if new else [])
+                            changed = True
+                u["perms"] = pm
+            if changed:
+                save(fn, items, 0o600)
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -1269,6 +1314,8 @@ def action():
     updf = request.form.get("updates", "")
     if kind not in ("ping", "facts", "updates"):
         abort(400)
+    if not can_do({"ping": "ping", "facts": "facts", "updates": "upd_check"}[kind]):
+        abort(403)
     act = [h for h in visible_hosts() if h.get("enabled", True) and h.get("address")]
     if target and target != "all":
         names = [h["name"] for h in act if h["name"] == target or h["group"] == target]
@@ -1321,6 +1368,8 @@ def reboot_action():
     """Neustart einer Maschine (target) oder aus dem Dialog: angehakte Maschinen in der gewaehlten Reihenfolge,
     sofort oder geplant."""
     target = request.form.get("target", "")
+    if not can_do("reboot") or (not target and request.form.get("mode") == "plan" and not can_do("plan")):
+        abort(403)
     act = {h["name"]: h for h in visible_hosts() if h.get("enabled", True) and h.get("address")}
     if target:
         names = [target] if target in act else []
@@ -1388,6 +1437,9 @@ def mass_action():
     kind = request.form.get("kind")
     if kind not in ("check", "update"):
         abort(400)
+    if not can_do("upd_check" if kind == "check" else "upd_install") or \
+            (kind == "update" and request.form.get("mode") == "plan" and not can_do("plan")):
+        abort(403)
     grp, loc, stat = request.form.get("gruppe", ""), request.form.get("standort", ""), request.form.get("status", "")
     updf = request.form.get("updates", "")
     st = load("status.json", {})
@@ -1435,6 +1487,8 @@ def mass_action():
 @run_required
 def plan_delete():
     pid = request.form.get("id", "")
+    if not can_do("plan"):
+        abort(403)
     vis = {h["name"] for h in visible_hosts()}
     with LOCK:
         save("schedule.json", [x for x in load("schedule.json", []) if x["id"] != pid
@@ -1637,6 +1691,8 @@ def playbook_start():
     if target not in valid:
         abort(400 if is_admin() else 403)
     check = bool(request.form.get("check"))
+    if not is_admin() and not can_do("upd_check" if check else "upd_install"):
+        abort(403)
     rid = new_run("playbook", target, f"{pb} auf {target}" + (" (Probelauf)" if check else ""),
                   [target] if target not in ("all", *GROUPS) else None)
     start(playbook_job, rid, pb, target, check)
@@ -1890,14 +1946,16 @@ def perms_summary(u):
 @app.route("/benutzer")
 @admin_required
 def user_list():
-    return render_template("users.html", users=users_data(), summary=perms_summary, now_ts=time.time())
+    gname = {g["id"]: g["name"] for g in groups_data()}
+    return render_template("users.html", users=users_data(), summary=perms_summary, now_ts=time.time(), actions=ACTIONS,
+                           eff_actions=eff_actions, gname=gname)
 
 
 @app.route("/benutzer/neu", methods=["GET", "POST"])
 @app.route("/benutzer/<uname>", methods=["GET", "POST"])
 @admin_required
 def user_edit(uname=None):
-    u = find_user(uname) if uname else {"name": "", "source": "local", "email": "", "can_run": False, "perms": {}}
+    u = find_user(uname) if uname else {"name": "", "source": "local", "email": "", "actions": [], "groups": [], "perms": {}}
     if u is None:
         abort(404)
     hs = hosts()
@@ -1943,18 +2001,10 @@ def user_edit(uname=None):
             return redirect(url_for("user_edit", uname=uname))
         name = uname or request.form.get("name", "").strip()
         email = request.form.get("email", "").strip()
-        perms = {}
-        for i, loc in enumerate(locs):
-            mode = request.form.get(f"m{i}", "")
-            if mode == "all":
-                perms[loc] = "*"
-            elif mode in ("linux", "windows"):
-                perms[loc] = "group:" + mode
-            elif mode == "sel":
-                names = [x for x in request.form.getlist(f"h{i}")
-                         if any(h["name"] == x and (h.get("location") or "") == loc for h in hs)]
-                if names:
-                    perms[loc] = names
+        perms = parse_perms(request.form, locs, hs)
+        actions = [k for k in ACTIONS if request.form.get("a_" + k)]
+        gids = {g["id"] for g in groups_data()}
+        ugroups = [x for x in request.form.getlist("grp") if x in gids]
         is_ad = u.get("source") == "ad"
         new_pw, rep_ = request.form.get("password", ""), request.form.get("password2", "")
         send_inv = bool(request.form.get("send_invite")) and not uname
@@ -1969,15 +2019,16 @@ def user_edit(uname=None):
             err = pw_problem(new_pw, rep_)
         if err:
             flash(err, "err")
-            return render_template("user.html", u={**u, "name": name, "email": email, "can_run": bool(request.form.get("can_run")),
-                                                    "perms": perms}, uname=uname, locs=locs, hs=hs)
+            return render_template("user.html", u={**u, "name": name, "email": email, "actions": actions, "groups": ugroups,
+                                                    "perms": perms}, uname=uname, locs=locs, hs=hs, **user_ctx())
         with LOCK:
             us = users_data()
             cur = next((x for x in us if x["name"] == name), None)
             if cur is None:
                 cur = {"name": name, "source": "local", "created": now()}
                 us.append(cur)
-            cur.update(can_run=bool(request.form.get("can_run")), perms=perms, email=email, changed=now())
+            cur.update(actions=actions, groups=ugroups, perms=perms, email=email, changed=now())
+            cur.pop("can_run", None)
             if new_pw and not is_ad:
                 cur["hash"] = generate_password_hash(new_pw)
                 cur.pop("must_change", None)
@@ -1992,13 +2043,88 @@ def user_edit(uname=None):
                 msg += f" Einladung an {email} gesendet."
             except Exception as ex:  # noqa: BLE001
                 flash(f"Benutzer angelegt, aber die Einladung konnte nicht gesendet werden: {ex}", "err")
-        if not perms:
-            flash(msg + " Achtung: noch keine Standorte freigegeben – sieht nichts.", "err")
+        if not perms and not ugroups:
+            flash(msg + " Achtung: weder Standorte noch Gruppe – sieht nichts.", "err")
         else:
             flash(msg, "ok")
         return redirect(url_for("user_edit", uname=name))
-    return render_template("user.html", u=u, uname=uname, locs=locs, hs=hs,
-                           mail_ok=bool(dir_conf()["mail"]["host"]), now_ts=time.time())
+    return render_template("user.html", u=u, uname=uname, locs=locs, hs=hs, **user_ctx())
+
+
+def user_ctx():
+    return {"mail_ok": bool(dir_conf()["mail"]["host"]), "now_ts": time.time(), "actions": ACTIONS, "all_groups": groups_data(),
+            "own_actions": own_actions, "eff_actions": eff_actions}
+
+
+def parse_perms(form, locs, hs):
+    perms = {}
+    for i, loc in enumerate(locs):
+        mode = form.get(f"m{i}", "")
+        if mode == "all":
+            perms[loc] = "*"
+        elif mode in ("linux", "windows"):
+            perms[loc] = "group:" + mode
+        elif mode == "sel":
+            names = [x for x in form.getlist(f"h{i}") if any(h["name"] == x and (h.get("location") or "") == loc for h in hs)]
+            if names:
+                perms[loc] = names
+    return perms
+
+
+@app.route("/benutzer/gruppen")
+@admin_required
+def group_list():
+    us = users_data()
+    members = {g["id"]: [u["name"] for u in us if g["id"] in (u.get("groups") or [])] for g in groups_data()}
+    return render_template("groups.html", grps=groups_data(), members=members, summary=perms_summary, actions=ACTIONS)
+
+
+@app.route("/benutzer/gruppe/neu", methods=["GET", "POST"])
+@app.route("/benutzer/gruppe/<gid>", methods=["GET", "POST"])
+@admin_required
+def group_edit(gid=None):
+    g = next((x for x in groups_data() if x["id"] == gid), None) if gid else {"id": "", "name": "", "actions": [], "perms": {}}
+    if g is None:
+        abort(404)
+    hs = hosts()
+    locs = loc_names() + ([""] if any(not h.get("location") for h in hs) else [])
+    us = users_data()
+    if request.method == "POST":
+        if request.form.get("act") == "delete" and gid:
+            with LOCK:
+                save("groups.json", [x for x in groups_data() if x["id"] != gid], 0o600)
+                us = users_data()
+                for u in us:
+                    if gid in (u.get("groups") or []):
+                        u["groups"] = [x for x in u["groups"] if x != gid]
+                save("users.json", us, 0o600)
+            flash(f"Gruppe {g['name']} gelöscht.", "ok")
+            return redirect(url_for("group_list"))
+        name = re.sub(r"\s+", " ", request.form.get("name", "")).strip()[:60]
+        new = {"name": name, "actions": [k for k in ACTIONS if request.form.get("a_" + k)], "perms": parse_perms(request.form, locs, hs)}
+        if not name or not LOCNAME_RE.match(name) or any(x["name"].lower() == name.lower() and x["id"] != gid for x in groups_data()):
+            flash("Name fehlt, ist ungültig oder schon vergeben.", "err")
+            return render_template("group.html", g={**g, **new}, gid=gid, locs=locs, hs=hs, actions=ACTIONS, us=us,
+                                   members=set(request.form.getlist("member")))
+        with LOCK:
+            gs = groups_data()
+            cur = next((x for x in gs if x["id"] == gid), None)
+            if cur is None:
+                cur = {"id": uuid.uuid4().hex[:8], "created": now()}
+                gs.append(cur)
+            cur.update(new, changed=now())
+            save("groups.json", gs, 0o600)
+            mem = set(request.form.getlist("member"))
+            us = users_data()
+            for u in us:
+                have = cur["id"] in (u.get("groups") or [])
+                if (u["name"] in mem) != have:
+                    u["groups"] = [x for x in (u.get("groups") or []) if x != cur["id"]] + ([cur["id"]] if u["name"] in mem else [])
+            save("users.json", us, 0o600)
+        flash(f"Gruppe {name} gespeichert.", "ok")
+        return redirect(url_for("group_edit", gid=cur["id"]))
+    return render_template("group.html", g=g, gid=gid, locs=locs, hs=hs, actions=ACTIONS, us=us,
+                           members={u["name"] for u in us if gid and gid in (u.get("groups") or [])})
 
 
 # ---------------------------------------------------------------- E-Mail und Active Directory
@@ -2257,7 +2383,7 @@ def ad_add():
         with LOCK:
             us = users_data()
             us.append({"name": e["sam"], "source": "ad", "display": e["display"], "email": e["mail"], "ad_dn": e["dn"],
-                       "can_run": False, "perms": {}, "created": now(), "changed": now()})
+                       "actions": [], "groups": [], "perms": {}, "created": now(), "changed": now()})
             save("users.json", us, 0o600)
         flash(f"AD-Benutzer {e['display'] or e['sam']} übernommen – jetzt die Rechte festlegen.", "ok")
         return redirect(url_for("user_edit", uname=e["sam"]))
@@ -2407,20 +2533,19 @@ INDEX = """{% extends "base.html" %}{% block title %}Maschinen{% endblock %}
  <a class="btn {{ 'acc' if not grp }}" href="{{ qs(standort=loc, status=stat, updates=updf) }}">Alle</a>
  {% for g in groups %}<a class="btn {{ 'acc' if grp==g }}" href="{{ qs(gruppe=g, standort=loc, status=stat, updates=updf) }}">{{ g|capitalize }}</a>{% endfor %}
  <span style="flex:1"></span>
- {% if can_run %}
- <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}">
-  <input type="hidden" name="kind" value="ping"><input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button>{{ 'Alle' if not (grp or loc or stat or updf) else 'Auswahl' }} pingen</button></form>
- <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}">
-  <input type="hidden" name="kind" value="facts"><input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button>Info Device {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }}</button></form>
- <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}">
+ {% if can.ping %}<form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}">
+  <input type="hidden" name="kind" value="ping"><input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button>{{ 'Alle' if not (grp or loc or stat or updf) else 'Auswahl' }} pingen</button></form>{% endif %}
+ {% if can.facts %}<form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}">
+  <input type="hidden" name="kind" value="facts"><input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button>Info Device {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }}</button></form>{% endif %}
+ {% if can.upd_check %}<form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}">
   <input type="hidden" name="kind" value="updates"><input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button title="sucht nur, installiert nichts">Updates {{ 'aller' if not (grp or loc or stat or updf) else 'der Auswahl' }} prüfen</button></form>
  <form class="inl" method="post" action="/massen"><input type="hidden" name="csrf" value="{{csrf}}">
   <input type="hidden" name="kind" value="check"><input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button title="Probelauf der Update-Playbooks – installiert nichts">Check {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }}</button></form>
- <button type="button" class="acc" {{ 'disabled' if not upd_rows }} title="Maschinen auswählen, sofort oder geplant" onclick="document.getElementById('dlg-upd').showModal();updCount()">Update {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }} ({{ n_upd }})</button>
- {% if reboot_rows %}<button type="button" class="danger" title="Reihenfolge festlegen – streng nacheinander" onclick="document.getElementById('dlg-rb').showModal();rbUpd()">Neustart {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }} ({{ n_reboot }})</button>{% endif %}
- {% endif %}{% if admin %}<a class="btn acc" href="/maschine/neu{{ ('?standort=' ~ loc) if loc }}">+ Maschine</a>{% endif %}
+ {% endif %}{% if can.upd_install %}<button type="button" class="acc" {{ 'disabled' if not upd_rows }} title="Maschinen auswählen, sofort oder geplant" onclick="document.getElementById('dlg-upd').showModal();updCount()">Update {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }} ({{ n_upd }})</button>
+ {% endif %}{% if reboot_rows and can.reboot %}<button type="button" class="danger" title="Reihenfolge festlegen – streng nacheinander" onclick="document.getElementById('dlg-rb').showModal();rbUpd()">Neustart {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }} ({{ n_reboot }})</button>{% endif %}
+ {% if admin %}<a class="btn acc" href="/maschine/neu{{ ('?standort=' ~ loc) if loc }}">+ Maschine</a>{% endif %}
 </div>
-{% for pl in plans %}<div class="flash plan">{% if can_run %}<form class="inl" method="post" action="/geplant/loeschen" style="float:right;margin-left:12px"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="id" value="{{ pl.id }}"><button class="small" onclick="return confirm('Geplanten Lauf {{ pl.when }} entfernen?')">{{ 'Löschen' if pl.status == 'geplant' else 'Ausblenden' }}</button></form>{% endif %}
+{% for pl in plans %}<div class="flash plan">{% if can.plan %}<form class="inl" method="post" action="/geplant/loeschen" style="float:right;margin-left:12px"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="id" value="{{ pl.id }}"><button class="small" onclick="return confirm('Geplanten Lauf {{ pl.when }} entfernen?')">{{ 'Löschen' if pl.status == 'geplant' else 'Ausblenden' }}</button></form>{% endif %}
  &#128339; {% if pl.status == 'geplant' %}Geplant{% elif pl.status == 'gestartet' %}Gestartet{% else %}<span class="st-err">Verpasst</span>{% endif %}: {{ 'Neustart' if pl.kind == 'reboot' else 'Update' }} am <b>{{ pl.when[8:10] }}.{{ pl.when[5:7] }}.{{ pl.when[:4] }} um {{ pl.when[11:] }}</b> – {{ pl.names|length }} Maschine(n){% if pl.kind == 'reboot' %} nacheinander{% if pl.wait %}, je {{ pl.wait }} min Pause{% endif %}{% endif %}
  <div class="small mut">{% for n in pl.names %}{{ disp.get(n, n) }}{% if not loop.last %}{{ ' → ' if pl.kind == 'reboot' else ', ' }}{% endif %}{% endfor %}{% if pl.status == 'verpasst' %} · nicht ausgeführt, Container war zum Zeitpunkt nicht aktiv{% endif %}</div></div>{% endfor %}
 <dialog id="dlg-rb"><form method="post" action="/neustart" onsubmit="return rbSubmit(this)"><input type="hidden" name="csrf" value="{{csrf}}">
@@ -2429,26 +2554,29 @@ INDEX = """{% extends "base.html" %}{% block title %}Maschinen{% endblock %}
 (Linux: <code>systemctl is-system-running</code> = running, Windows: keine Dienste mehr im Start). Kommt eine nicht zurück, bricht die Kette ab.</div>
 <div style="max-height:46vh;overflow:auto;border:1px solid var(--line);border-radius:8px"><table class="dlg" id="rb-list">
 {% for r in reboot_rows %}<tr data-n="{{ r.name }}"><td style="width:1%"><input type="checkbox" class="rbh" name="host" value="{{ r.name }}" id="rb-{{ loop.index }}" {{ '' if r.no_mass else 'checked' }} onchange="rbUpd()"></td>
-<td style="width:1%" class="rbpos st-warn"></td>
+<td style="width:1%"><input type="number" class="rbnum" min="1" style="width:58px;padding:4px 6px" title="Position in der Reihenfolge" onchange="rbSort(this)"></td>
 <td><label for="rb-{{ loop.index }}" class="plain"><b>{{ r.display or r.name }}</b>{% if r.no_mass %} <span class="st-warn small">nur einzeln</span>{% endif %}</label>{% if r.location %}<div class="mut small">&#128205; {{ r.location }}</div>{% endif %}</td>
 <td><span class="tag {{ r.group }}">{{ r.group }}</span></td>
 <td style="white-space:nowrap;width:1%"><button type="button" class="small" title="früher" onclick="rbMove(this,-1)">&#9650;</button> <button type="button" class="small" title="später" onclick="rbMove(this,1)">&#9660;</button></td></tr>{% endfor %}
 </table></div>
 <div class="when"><label class="plain">danach jeweils noch <input type="number" name="wait" value="0" min="0" max="120" style="width:70px"> min warten</label></div>
 <div class="when"><label class="plain"><input type="radio" name="mode" value="jetzt" checked onchange="rbUpd()"> sofort starten</label>
-<label class="plain"><input type="radio" name="mode" value="plan" id="rb-plan" onchange="rbUpd()"> geplant am</label>
-<input type="datetime-local" name="when" id="rb-when" min="{{ now_min }}" style="width:auto" onfocus="document.getElementById('rb-plan').checked=true;rbUpd()" onchange="document.getElementById('rb-plan').checked=true;rbUpd()"></div>
+{% if can.plan %}<label class="plain"><input type="radio" name="mode" value="plan" id="rb-plan" onchange="rbUpd()"> geplant am</label>{% else %}<input type="radio" id="rb-plan" hidden disabled>{% endif %}
+<input type="datetime-local" name="when" id="rb-when" {{ '' if can.plan else 'hidden' }} min="{{ now_min }}" style="width:auto" onfocus="document.getElementById('rb-plan').checked=true;rbUpd()" onchange="document.getElementById('rb-plan').checked=true;rbUpd()"></div>
 <p style="text-align:right;margin:12px 0 0"><button type="button" onclick="this.closest('dialog').close()">Abbrechen</button> <button class="danger" id="rb-go">Neu starten</button></p>
 </form></dialog>
 <script>
 function rbMove(b,d){var tr=b.closest('tr'),o=d<0?tr.previousElementSibling:tr.nextElementSibling;if(!o)return;
  if(d<0)tr.parentNode.insertBefore(tr,o);else tr.parentNode.insertBefore(o,tr);rbUpd()}
-function rbUpd(){var k=0;document.querySelectorAll('#rb-list tr').forEach(function(tr){var c=tr.querySelector('.rbh');tr.querySelector('.rbpos').textContent=c.checked?(++k)+'.':'';tr.style.opacity=c.checked?1:.55});
+function rbSort(inp){var tb=document.getElementById('rb-list').tBodies[0]||document.getElementById('rb-list'),tr=inp.closest('tr'),c=tr.querySelector('.rbh'),
+ v=parseInt(inp.value,10);if(!c.checked){c.checked=true}var rows=[].filter.call(tb.querySelectorAll('tr'),function(r){return r!==tr&&r.querySelector('.rbh').checked});
+ v=Math.max(1,Math.min(isNaN(v)?rows.length+1:v,rows.length+1));var ref=rows[v-1]||null;if(ref)tb.insertBefore(tr,ref);else{var last=rows[rows.length-1];if(last)tb.insertBefore(tr,last.nextElementSibling);else tb.insertBefore(tr,tb.firstElementChild)}rbUpd()}
+function rbUpd(){var k=0;document.querySelectorAll('#rb-list tr').forEach(function(tr){var c=tr.querySelector('.rbh'),n=tr.querySelector('.rbnum');n.value=c.checked?(++k):'';n.disabled=!c.checked;tr.style.opacity=c.checked?1:.55});
  var pl=document.getElementById('rb-plan').checked,b=document.getElementById('rb-go');b.textContent=(pl?'Planen':'Jetzt neu starten')+' ('+k+')';b.disabled=!k}
 function rbSubmit(f){var names=[].map.call(f.querySelectorAll('.rbh:checked'),function(c){return c.closest('tr').querySelector('b').textContent});if(!names.length)return false;
  if(document.getElementById('rb-plan').checked){var w=document.getElementById('rb-when').value;if(!w){alert('Bitte Datum und Uhrzeit angeben.');return false}
   if(new Date(w)<=new Date()){alert('Der Zeitpunkt liegt in der Vergangenheit.');return false}return true}
- return confirm('Jetzt nacheinander neu starten?\n\n'+names.map(function(n,i){return (i+1)+'. '+n}).join('\n'))}
+ return confirm('Jetzt nacheinander neu starten?\\n\\n'+names.map(function(n,i){return (i+1)+'. '+n}).join('\\n'))}
 </script>
 <dialog id="dlg-upd"><form method="post" action="/massen" onsubmit="return updSubmit(this)"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="update"><input type="hidden" name="pick" value="1">
 <h2 style="margin:0 0 4px;color:var(--text)">Updates installieren</h2>
@@ -2460,8 +2588,8 @@ function rbSubmit(f){var names=[].map.call(f.querySelectorAll('.rbh:checked'),fu
 <td class="small" style="white-space:nowrap"><span class="st-warn">{{ u.count }} Update{{ 's' if u.count != 1 }}</span>{% if u.security %}<div class="st-err">{{ u.security }} Sicherheit</div>{% endif %}</td></tr>{% endfor %}
 </table></div>
 <div class="when"><label class="plain"><input type="radio" name="mode" value="jetzt" checked onchange="updCount()"> sofort starten</label>
-<label class="plain"><input type="radio" name="mode" value="plan" id="upd-plan" onchange="updCount()"> geplant am</label>
-<input type="datetime-local" name="when" id="upd-when" min="{{ now_min }}" style="width:auto" onfocus="document.getElementById('upd-plan').checked=true;updCount()" onchange="document.getElementById('upd-plan').checked=true;updCount()"></div>
+{% if can.plan %}<label class="plain"><input type="radio" name="mode" value="plan" id="upd-plan" onchange="updCount()"> geplant am</label>{% else %}<input type="radio" id="upd-plan" hidden disabled>{% endif %}
+<input type="datetime-local" name="when" id="upd-when" {{ '' if can.plan else 'hidden' }} min="{{ now_min }}" style="width:auto" onfocus="document.getElementById('upd-plan').checked=true;updCount()" onchange="document.getElementById('upd-plan').checked=true;updCount()"></div>
 <div class="hint">Geplante Läufe stehen oben auf der Startseite und lassen sich dort wieder löschen.</div>
 <p style="text-align:right;margin:12px 0 0"><button type="button" onclick="this.closest('dialog').close()">Abbrechen</button> <button class="acc" id="upd-go">Installieren</button></p>
 </form></dialog>
@@ -2505,16 +2633,16 @@ function updSubmit(f){var n=f.querySelectorAll('.updh:checked').length;if(!n)ret
  {% if u and u.release and u.release.new %}<div style="color:#7cb7ff" title="aktuell: {{ u.release.cur }}">&#11014; {{ u.release.new }} verfügbar</div>{% endif %}
  {% if u %}<div class="mut" title="{{ u.stale or '' }}">{{ u.time[:16] }}{% if u.stale %} *{% endif %}</div>{% endif %}
 </div>
- {% set pb = 'updates-installieren-' ~ r.group ~ '.yml' %}{% if r.enabled and r.address and pb in pbs and can_run %}
- <div style="white-space:nowrap;text-align:center"><div><form class="inl" method="post" action="/playbook/start"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="playbook" value="{{ pb }}"><input type="hidden" name="target" value="{{ r.name }}"><input type="hidden" name="check" value="1"><button title="Probelauf: zeigt, was installiert würde">Check</button></form>
- {% if u and u.ok and u.count %}<form class="inl" method="post" action="/playbook/start" onsubmit="return confirm('{{ u.count }} Update(s) auf {{ r.display or r.name }} jetzt installieren?{{ ' (Windows: kann dauern, Programme vorher schließen)' if r.group == 'windows' }}')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="playbook" value="{{ pb }}"><input type="hidden" name="target" value="{{ r.name }}"><button class="acc" title="Updates installieren (ohne Neustart)">Update</button></form>{% endif %}
- {% if u and u.reboot %}<form class="inl" method="post" action="/neustart" onsubmit="return confirm('{{ r.display or r.name }} jetzt neu starten?{{ ' ACHTUNG: Docker-Host bzw. nur-einzeln-Maschine – dabei sind alle Dienste darauf weg, auch diese Seite.' if r.no_mass }}')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ r.name }}"><button class="danger" title="Maschine neu starten">Neustart</button></form>{% endif %}
- {% if admin and u and u.release and u.release.new and r.group == 'linux' and 'pve' not in (r.sum.kernel or '') %}<form class="inl" method="post" action="/upgrade" onsubmit="return confirm('Distributions-Upgrade von {{ r.display or r.name }} auf {{ u.release.new }} starten?\n\nVORHER einen Snapshot bzw. ein Backup machen!\nDauert 20–60 Minuten, die Maschine startet dabei neu und ist zeitweise nicht erreichbar.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ r.name }}"><button style="background:#1f3b63;border-color:#2f5b93" title="auf {{ u.release.new }} aktualisieren">Upgrade</button></form>{% endif %}</div>{% if r.no_mass %}<div class="mut" title="wird bei „Update alle“ ausgelassen">nur einzeln</div>{% endif %}</div>{% endif %}</div></td>
+ {% set pb = 'updates-installieren-' ~ r.group ~ '.yml' %}{% if r.enabled and r.address and pb in pbs and (can.upd_check or can.upd_install or can.reboot) %}
+ <div style="white-space:nowrap;text-align:center"><div><form class="inl" method="post" action="/playbook/start"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="playbook" value="{{ pb }}"><input type="hidden" name="target" value="{{ r.name }}"><input type="hidden" name="check" value="1"><button title="Probelauf: zeigt, was installiert würde" {{ '' if can.upd_check else 'hidden' }}>Check</button></form>
+ {% if u and u.ok and u.count and can.upd_install %}<form class="inl" method="post" action="/playbook/start" onsubmit="return confirm('{{ u.count }} Update(s) auf {{ r.display or r.name }} jetzt installieren?{{ ' (Windows: kann dauern, Programme vorher schließen)' if r.group == 'windows' }}')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="playbook" value="{{ pb }}"><input type="hidden" name="target" value="{{ r.name }}"><button class="acc" title="Updates installieren (ohne Neustart)">Update</button></form>{% endif %}
+ {% if u and u.reboot and can.reboot %}<form class="inl" method="post" action="/neustart" onsubmit="return confirm('{{ r.display or r.name }} jetzt neu starten?{{ ' ACHTUNG: Docker-Host bzw. nur-einzeln-Maschine – dabei sind alle Dienste darauf weg, auch diese Seite.' if r.no_mass }}')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ r.name }}"><button class="danger" title="Maschine neu starten">Neustart</button></form>{% endif %}
+ {% if admin and u and u.release and u.release.new and r.group == 'linux' and 'pve' not in (r.sum.kernel or '') %}<form class="inl" method="post" action="/upgrade" onsubmit="return confirm('Distributions-Upgrade von {{ r.display or r.name }} auf {{ u.release.new }} starten?\\n\\nVORHER einen Snapshot bzw. ein Backup machen!\\nDauert 20–60 Minuten, die Maschine startet dabei neu und ist zeitweise nicht erreichbar.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ r.name }}"><button style="background:#1f3b63;border-color:#2f5b93" title="auf {{ u.release.new }} aktualisieren">Upgrade</button></form>{% endif %}</div>{% if r.no_mass %}<div class="mut" title="wird bei „Update alle“ ausgelassen">nur einzeln</div>{% endif %}</div>{% endif %}</div></td>
 <td class="small" style="white-space:nowrap" title="{{ r.st.ping_time or '' }}">{% if r.st.ping_time %}{{ r.st.ping_time[8:10] }}.{{ r.st.ping_time[5:7] }}. {{ r.st.ping_time[11:16] }}{% else %}–{% endif %}{% if r.st.ping_msg and not r.st.ping_ok %}<div class="st-err" style="white-space:normal;max-width:220px">{{ r.st.ping_msg }}</div>{% endif %}</td>
-<td style="white-space:nowrap">{% if r.enabled and r.address and can_run %}
- <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="ping"><input type="hidden" name="target" value="{{ r.name }}"><button>Ping</button></form>
- <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="facts"><input type="hidden" name="target" value="{{ r.name }}"><button>Info</button></form>
- <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="updates"><input type="hidden" name="target" value="{{ r.name }}"><button title="Updates suchen (installiert nichts)">Updates</button></form>{% endif %}
+<td style="white-space:nowrap">{% if r.enabled and r.address %}
+ {% if can.ping %}<form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="ping"><input type="hidden" name="target" value="{{ r.name }}"><button>Ping</button></form>{% endif %}
+ {% if can.facts %}<form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="facts"><input type="hidden" name="target" value="{{ r.name }}"><button>Info</button></form>{% endif %}
+ {% if can.upd_check %}<form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="updates"><input type="hidden" name="target" value="{{ r.name }}"><button title="Updates suchen (installiert nichts)">Updates</button></form>{% endif %}{% endif %}
  <a class="btn" href="/maschine/{{ r.name }}">Details</a></td></tr>{% endfor %}
 </table></div>{% endblock %}"""
 
@@ -2525,18 +2653,18 @@ MACHINE = """{% extends "base.html" %}{% block title %}{{ (h.display or name) if
  {% if st.ping_time %}<span class="dot {{ 'ok' if st.ping_ok else 'err' }}"></span>{{ 'erreichbar' if st.ping_ok else st.ping_msg }}<div class="mut small">{{ st.ping_time }}</div>{% else %}<span class="mut">noch nie geprüft</span>{% endif %}
  <div class="mut small">Info Device: {{ st.facts_time or 'noch keine' }}</div>
  {% if st.via %}<div class="small {{ 'mut' if st.via.ok else 'st-err' }}">{{ ('zuletzt erreicht über ' ~ st.via.addr) if st.via.ok else 'keine der Adressen erreichbar' }} ({{ st.via.time }})</div>{% endif %}
- <p>{% if h.enabled and h.address and can_run %}
- <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="ping"><input type="hidden" name="target" value="{{ name }}"><button>Ping</button></form>
- <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="facts"><input type="hidden" name="target" value="{{ name }}"><button>Info Device</button></form>{% endif %}</p></div>
+ <p>{% if h.enabled and h.address %}
+ {% if can.ping %}<form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="ping"><input type="hidden" name="target" value="{{ name }}"><button>Ping</button></form>{% endif %}
+ {% if can.facts %}<form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="facts"><input type="hidden" name="target" value="{{ name }}"><button>Info Device</button></form>{% endif %}{% endif %}</p></div>
 <div class="card"><h2 style="margin-top:0">System</h2>{% if admin %}<div class="small mut">Zugang: {{ plabel }}</div>{% endif %}{% if s %}
  <div>{{ s.os }}</div><div class="mut small">{{ s.hostname }}</div>
  <div class="small">Kernel {{ s.kernel }} · {{ s.arch }} · {{ s.virt }}</div>
  <div class="small">{{ s.cpu }} vCPU · {{ s.ram }} RAM · läuft seit {{ s.uptime }}</div>
  <div class="small mut">IPs: {{ s.ips }}</div>{% else %}<span class="mut">Noch keine Infos – „Info Device“ drücken.</span>{% endif %}</div>
-{% if can_run %}<div class="card"><h2 style="margin-top:0">{{ 'Playbook ausführen' if admin else 'Updates installieren' }}</h2>
+{% if can.upd_check or can.upd_install %}<div class="card"><h2 style="margin-top:0">{{ 'Playbook ausführen' if admin else 'Updates installieren' }}</h2>
  {% if playbooks and h.enabled and h.address %}<form method="post" action="/playbook/start"><input type="hidden" name="csrf" value="{{csrf}}">
  <input type="hidden" name="target" value="{{ name }}"><select name="playbook">{% for pb in playbooks %}<option {{ 'selected' if pb == pb_default }}>{{pb}}</option>{% endfor %}</select>
- <label><input type="checkbox" name="check" value="1" style="width:auto" checked> nur Probelauf (--check)</label>
+ {% if can.upd_install %}<label><input type="checkbox" name="check" value="1" style="width:auto" checked> nur Probelauf (--check)</label>{% else %}<input type="hidden" name="check" value="1"><div class="mut small">nur Probelauf (--check) erlaubt</div>{% endif %}
  <p><button class="acc">Starten</button></p></form>{% else %}<span class="mut">{{ 'Maschine inaktiv oder ohne Adresse.' if playbooks else 'Kein Playbook für ' ~ h.group ~ ' vorhanden.' }}</span>{% endif %}</div>{% endif %}
 </div>
 <div class="card" id="updates"><h2 style="margin-top:0">Updates</h2>{% set u = st.upd %}
@@ -2546,13 +2674,13 @@ MACHINE = """{% extends "base.html" %}{% block title %}{{ (h.display or name) if
  {% if u.reboot %} · <span class="st-warn">Neustart nötig</span>{% endif %}</div>
  <div class="mut small">Geprüft {{ u.time }} über {{ u.pm }}{% if u.stale %} · letzter Versuch {{ u.stale }}{% endif %}</div>
  {% if u.release %}<div class="small" style="margin-top:4px">Version: {{ u.release.cur or s.os }}{% if u.release.new %} · <b style="color:#7cb7ff">&#11014; {{ u.release.new }} verfügbar</b> <span class="mut">(Distributions-Upgrade, nicht in den normalen Updates enthalten)</span>
- {% if admin and h.group == 'linux' and 'pve' not in (s.kernel or '') and h.enabled and h.address %}<form class="inl" method="post" action="/upgrade" onsubmit="return confirm('Distributions-Upgrade auf {{ u.release.new }} starten?\n\nVORHER einen Snapshot bzw. ein Backup machen!\nDauert 20–60 Minuten, die Maschine startet dabei neu.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ name }}"><button style="background:#1f3b63;border-color:#2f5b93">Upgrade auf {{ u.release.new }}</button></form>{% endif %}{% else %} · <span class="st-ok">neueste Version</span>{% endif %}</div>{% endif %}
+ {% if admin and h.group == 'linux' and 'pve' not in (s.kernel or '') and h.enabled and h.address %}<form class="inl" method="post" action="/upgrade" onsubmit="return confirm('Distributions-Upgrade auf {{ u.release.new }} starten?\\n\\nVORHER einen Snapshot bzw. ein Backup machen!\\nDauert 20–60 Minuten, die Maschine startet dabei neu.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ name }}"><button style="background:#1f3b63;border-color:#2f5b93">Upgrade auf {{ u.release.new }}</button></form>{% endif %}{% else %} · <span class="st-ok">neueste Version</span>{% endif %}</div>{% endif %}
  {% if u.warn %}<div class="st-warn small">{{ u.warn }}</div>{% endif %}
- {% if u['items'] %}<details {{ 'open' if u['items']|length <= 15 }} style="margin-top:8px"><summary class="mut">Liste ({{ u['items']|length }})</summary>
+ {% if (u.get('items') or []) %}<details {{ 'open' if (u.get('items') or [])|length <= 15 }} style="margin-top:8px"><summary class="mut">Liste ({{ (u.get('items') or [])|length }})</summary>
  <table style="margin-top:6px"><tr><th>Paket / Update</th><th>Installiert</th><th>Neu</th><th></th></tr>
- {% for i in u['items'] %}<tr><td>{{ i.name }}</td><td class="small mut">{{ i.from }}</td><td class="small">{{ i.to }}</td><td>{% if i.sec %}<span class="tag sec">Sicherheit</span>{% endif %}</td></tr>{% endfor %}</table></details>{% endif %}
+ {% for i in (u.get('items') or []) %}<tr><td>{{ i.name }}</td><td class="small mut">{{ i.from }}</td><td class="small">{{ i.to }}</td><td>{% if i.sec %}<span class="tag sec">Sicherheit</span>{% endif %}</td></tr>{% endfor %}</table></details>{% endif %}
  {% endif %}
- {% if h.enabled and h.address and can_run %}<form method="post" action="/aktion" style="margin-top:10px"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="updates"><input type="hidden" name="target" value="{{ name }}"><button>Updates prüfen</button> <span class="mut small">sucht nur – installiert wird mit einem Playbook (z. B. updates-installieren-{{ h.group }}.yml)</span></form>{% endif %}
+ {% if h.enabled and h.address and can.upd_check %}<form method="post" action="/aktion" style="margin-top:10px"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="updates"><input type="hidden" name="target" value="{{ name }}"><button>Updates prüfen</button> <span class="mut small">sucht nur – installiert wird mit einem Playbook (z. B. updates-installieren-{{ h.group }}.yml)</span></form>{% endif %}
 </div>{% endif %}
 {% if admin %}<div class="card"><h2 style="margin-top:0">{{ 'Bearbeiten' if name else 'Anlegen' }}</h2>
 <form method="post"><input type="hidden" name="csrf" value="{{csrf}}"><div class="grid">
@@ -2687,15 +2815,16 @@ document.getElementById('bpl').textContent=b.value=='su'?'Passwort des Zielbenut
 
 USERS = """{% extends "base.html" %}{% block title %}Benutzer{% endblock %}{% block body %}<div class="fit">
 <h1>Benutzer <span class="mut small">({{ users|length }})</span></h1>
-<div class="bar"><a class="btn acc" href="/benutzer/neu">+ Benutzer</a><a class="btn" href="/benutzer/ad">+ AD-Benutzer</a><span style="flex:1"></span><a class="btn" href="/benutzer/verzeichnis">&#9881; E-Mail &amp; AD</a></div>
+<div class="bar"><a class="btn acc" href="/benutzer/neu">+ Benutzer</a><a class="btn" href="/benutzer/ad">+ AD-Benutzer</a><a class="btn" href="/benutzer/gruppen">&#128101; Benutzergruppen</a><span style="flex:1"></span><a class="btn" href="/benutzer/verzeichnis">&#9881; E-Mail &amp; AD</a></div>
 <p class="mut small">Der Admin <b>{{ session.user }}</b> sieht und darf alles. Benutzer sehen nur die freigegebenen Standorte bzw. Maschinen.</p>
 <table class="auto"><tr><th>Benutzer</th><th>Anmeldung</th><th>Darf</th><th>Sieht</th><th>Geändert</th><th></th></tr>
 {% for u in users %}<tr><td><b>{{ u.display or u.name }}</b>{% if u.display %}<div class="mut small">{{ u.name }}</div>{% endif %}{% if u.email %}<div class="mut small">{{ u.email }}</div>{% endif %}</td>
 <td class="small">{% if u.source == 'ad' %}<span class="tag windows">AD</span>{% else %}<span class="tag">lokal</span>{% endif %}
  {% if u.invite and u.invite.expires > now_ts %}<div class="st-warn">Einladung offen</div>{% elif u.source != 'ad' and not u.hash %}<div class="st-err">kein Passwort</div>{% elif u.must_change %}<div class="st-warn">muss Passwort ändern</div>{% endif %}</td>
-<td>{% if u.can_run %}<span class="st-ok">ansehen + bedienen</span>{% else %}<span class="mut">nur ansehen</span>{% endif %}</td>
-<td class="small">{% for x in summary(u) %}<div>&#128205; {{ x }}</div>{% else %}<span class="st-err">nichts freigegeben</span>{% endfor %}</td>
-<td class="small mut" style="white-space:nowrap">{{ (u.changed or u.created or '')[:16] }}</td>
+<td class="small">{% set ea = eff_actions(u) %}{% if ea %}<span class="st-ok">{{ ea|map('extract', actions)|join(', ') }}</span>{% else %}<span class="mut">nur ansehen</span>{% endif %}
+ {% if u.groups %}<div class="mut">Gruppen: {{ u.groups|map('extract', gname)|join(', ') }}</div>{% endif %}</td>
+<td class="small">{% for x in summary(u) %}<div>&#128205; {{ x }}</div>{% else %}{% if u.groups %}<span class="mut">über Gruppen</span>{% else %}<span class="st-err">nichts freigegeben</span>{% endif %}{% endfor %}</td>
+<td class="small mut" style="white-space:nowrap">{{ (u.changed or u.created or '')|de_date }}</td>
 <td><a class="btn" href="/benutzer/{{ u.name }}">Bearbeiten</a></td></tr>
 {% else %}<tr><td colspan="6" class="mut">Noch keine Benutzer.</td></tr>{% endfor %}</table></div>{% endblock %}"""
 
@@ -2715,22 +2844,12 @@ USER = """{% extends "base.html" %}{% block title %}{{ uname or 'Neuer Benutzer'
 <label class="plain" style="display:block;margin-top:6px"><input type="checkbox" name="must_change" value="1" {{ 'checked' if not uname }}> beim ersten Login ändern lassen</label>
 {% if not uname %}<label class="plain" style="display:block;margin-top:6px"><input type="checkbox" name="send_invite" value="1" {{ '' if mail_ok else 'disabled' }} onchange="document.getElementById('pw1').required=false"> stattdessen per E-Mail einladen – der Benutzer legt sein Passwort selbst fest{% if not mail_ok %} <span class="mut small">(erst <a href="/benutzer/verzeichnis">E-Mail einrichten</a>)</span>{% endif %}</label>{% endif %}
 {% endif %}
-<label class="plain" style="display:block;margin-top:10px"><input type="checkbox" name="can_run" value="1" {{ 'checked' if u.can_run }}> darf bedienen: Ping, Info Device, Updates prüfen / installieren / planen, Neustart</label>
-<div class="hint">ohne Haken nur ansehen. Maschinen anlegen/bearbeiten, Playbooks, Einstellungen, Upgrades und Benutzer bleiben immer beim Admin.</div></div>
-<div class="card"><h2 style="margin-top:0">Was darf {{ uname or 'der Benutzer' }} sehen?</h2>
-<table class="dlg">{% for loc in locs %}{% set i = loop.index0 %}{% set v = u.perms.get(loc) %}{% set mode = 'all' if v == '*' else ('linux' if v == 'group:linux' else ('windows' if v == 'group:windows' else ('sel' if v else ''))) %}
-{% set lh = hs|selectattr('location', 'equalto', loc)|list if loc else hs|rejectattr('location')|list %}
-<tr><td style="width:28%"><b>&#128205; {{ loc or 'ohne Standort' }}</b><div class="mut small">{{ lh|length }} Maschine(n): {{ lh|selectattr('group', 'equalto', 'linux')|list|length }} Linux · {{ lh|selectattr('group', 'equalto', 'windows')|list|length }} Windows</div></td>
-<td><select name="m{{i}}" style="width:auto" onchange="this.closest('td').querySelector('.hl').hidden = this.value != 'sel'">
- <option value="" {{ 'selected' if not mode }}>nichts</option><option value="all" {{ 'selected' if mode == 'all' }}>alle Maschinen</option>
- <option value="linux" {{ 'selected' if mode == 'linux' }}>alle Linux-Maschinen</option><option value="windows" {{ 'selected' if mode == 'windows' }}>alle Windows-Maschinen</option>
- <option value="sel" {{ 'selected' if mode == 'sel' }}>nur ausgewählte</option></select>
- <span class="mut small">„alle …“ gilt auch für künftige Maschinen</span>
- <div class="hl" {{ '' if mode == 'sel' else 'hidden' }} style="margin-top:6px"><div class="small" style="margin-bottom:4px">Anhaken: <a href="#" onclick="return tick(this,'linux')">alle Linux</a> · <a href="#" onclick="return tick(this,'windows')">alle Windows</a> · <a href="#" onclick="return tick(this,'*')">alle</a> · <a href="#" onclick="return tick(this,'')">keine</a></div>
- {% for g in groups %}{% set gh = lh|selectattr('group', 'equalto', g)|list %}{% if gh %}<div class="mut small" style="margin-top:4px;text-transform:uppercase">{{ g }}</div>{% for h in gh %}
- <label class="plain" style="display:block"><input type="checkbox" name="h{{i}}" value="{{ h.name }}" data-g="{{ h.group }}" {{ 'checked' if v and v is not string and h.name in v }}> {{ h.display or h.name }} <span class="tag {{ h.group }}">{{ h.group }}</span>{% if not h.enabled %} <span class="mut small">inaktiv</span>{% endif %}</label>
- {% endfor %}{% endif %}{% endfor %}{% if not lh %}<span class="mut small">keine Maschinen</span>{% endif %}</div></td></tr>
-{% else %}<tr><td class="mut">Noch keine Standorte – unter Einstellungen anlegen.</td></tr>{% endfor %}</table></div>
+</div>
+<div class="card"><h2 style="margin-top:0">Gruppen</h2>{% for g in all_groups %}
+<label class="plain" style="display:block"><input type="checkbox" name="grp" value="{{ g.id }}" {{ 'checked' if g.id in (u.groups or []) }}> <b>{{ g.name }}</b> <span class="mut small">{{ g.actions|map('extract', actions)|join(', ') or 'nur ansehen' }}</span></label>
+{% else %}<span class="mut small">Noch keine Gruppen – <a href="/benutzer/gruppen">Benutzergruppe anlegen</a>.</span>{% endfor %}</div>
+<div class="card"><h2 style="margin-top:0">Was darf {{ uname or 'der Benutzer' }}?</h2>{% set acts = own_actions(u) %}{% set inherited = eff_actions(u) %}{% include "acts.html" %}</div>
+{% set pobj = u.perms %}{% set ptitle = 'Was darf ' ~ (uname or 'der Benutzer') ~ ' selbst sehen?' %}{% set phint = 'zusätzlich zu dem, was seine Gruppen freigeben' if all_groups else '' %}{% include "perms.html" %}
 <p><button class="acc">Speichern</button> <a class="btn" href="/benutzer">Zurück</a></p></form>
 {% if uname %}<div class="card"><h2 style="margin-top:0">{{ 'Zugang' if u.source == 'ad' else 'Passwort zurücksetzen / einladen' }}</h2><div class="bar" style="margin:0">
 {% if u.source != 'ad' %}<form class="inl" method="post" onsubmit="return confirm('Neues Zufallspasswort für {{ uname }} erzeugen? Das alte gilt dann nicht mehr.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="act" value="resetpw"><button>&#127922; Zufallspasswort setzen</button></form>{% endif %}
@@ -2805,6 +2924,47 @@ FORBIDDEN = """{% extends "base.html" %}{% block title %}Keine Berechtigung{% en
 <div class="card" style="max-width:480px;margin:40px auto"><h1>Keine Berechtigung</h1><p class="mut">Dafür fehlen dir die Rechte. Wende dich an den Admin.</p>
 <p><a class="btn acc" href="/">Zur Maschinenliste</a></p></div>{% endblock %}"""
 
+PERMS = """<div class="card"><h2 style="margin-top:0">{{ ptitle }}</h2>{% if phint %}<div class="hint" style="margin-bottom:8px">{{ phint }}</div>{% endif %}
+<table class="dlg">{% for loc in locs %}{% set i = loop.index0 %}{% set v = pobj.get(loc) %}{% set mode = 'all' if v == '*' else ('linux' if v == 'group:linux' else ('windows' if v == 'group:windows' else ('sel' if v else ''))) %}
+{% set lh = hs|selectattr('location', 'equalto', loc)|list if loc else hs|rejectattr('location')|list %}
+<tr><td style="width:28%"><b>&#128205; {{ loc or 'ohne Standort' }}</b><div class="mut small">{{ lh|length }} Maschine(n): {{ lh|selectattr('group', 'equalto', 'linux')|list|length }} Linux · {{ lh|selectattr('group', 'equalto', 'windows')|list|length }} Windows</div></td>
+<td><select name="m{{i}}" style="width:auto" onchange="this.closest('td').querySelector('.hl').hidden = this.value != 'sel'">
+ <option value="" {{ 'selected' if not mode }}>nichts</option><option value="all" {{ 'selected' if mode == 'all' }}>alle Maschinen</option>
+ <option value="linux" {{ 'selected' if mode == 'linux' }}>alle Linux-Maschinen</option><option value="windows" {{ 'selected' if mode == 'windows' }}>alle Windows-Maschinen</option>
+ <option value="sel" {{ 'selected' if mode == 'sel' }}>nur ausgewählte</option></select>
+ <span class="mut small">„alle …“ gilt auch für künftige Maschinen</span>
+ <div class="hl" {{ '' if mode == 'sel' else 'hidden' }} style="margin-top:6px"><div class="small" style="margin-bottom:4px">Anhaken: <a href="#" onclick="return tick(this,'linux')">alle Linux</a> · <a href="#" onclick="return tick(this,'windows')">alle Windows</a> · <a href="#" onclick="return tick(this,'*')">alle</a> · <a href="#" onclick="return tick(this,'')">keine</a></div>
+ {% for g in groups %}{% set gh = lh|selectattr('group', 'equalto', g)|list %}{% if gh %}<div class="mut small" style="margin-top:4px;text-transform:uppercase">{{ g }}</div>{% for h in gh %}
+ <label class="plain" style="display:block"><input type="checkbox" name="h{{i}}" value="{{ h.name }}" data-g="{{ h.group }}" {{ 'checked' if v and v is not string and h.name in v }}> {{ h.display or h.name }} <span class="tag {{ h.group }}">{{ h.group }}</span>{% if not h.enabled %} <span class="mut small">inaktiv</span>{% endif %}</label>
+ {% endfor %}{% endif %}{% endfor %}{% if not lh %}<span class="mut small">keine Maschinen</span>{% endif %}</div></td></tr>
+{% else %}<tr><td class="mut">Noch keine Standorte – unter Einstellungen anlegen.</td></tr>{% endfor %}</table></div>"""
+
+ACTS = """<div class="grid top" style="grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:4px 12px">{% for k, v in actions.items() %}
+<label class="plain" style="display:block"><input type="checkbox" name="a_{{ k }}" value="1" {{ 'checked' if k in acts }}> {{ v }}{% if k in inherited and k not in acts %} <span class="mut small">(über Gruppe)</span>{% endif %}</label>{% endfor %}</div>
+<div class="hint">ohne Haken nur ansehen. „Planen“ braucht zusätzlich „Updates installieren“ bzw. „Neustart“. Maschinen, Playbooks, Einstellungen, Upgrades und Benutzer bleiben immer beim Admin.</div>"""
+
+GROUPS_T = """{% extends "base.html" %}{% block title %}Benutzergruppen{% endblock %}{% block body %}<div class="fit">
+<h1>Benutzergruppen <span class="mut small">({{ grps|length }})</span></h1>
+<p class="mut small">Eine Gruppe bündelt Rechte und sichtbare Standorte/Maschinen. Ein Benutzer darf alles, was seine Gruppen und seine eigenen Einstellungen zusammen erlauben.</p>
+<table class="auto"><tr><th>Gruppe</th><th>Darf</th><th>Sieht</th><th>Mitglieder</th><th></th></tr>
+{% for g in grps %}<tr><td><b>{{ g.name }}</b></td><td class="small">{{ g.actions|map('extract', actions)|join(', ') or 'nur ansehen' }}</td>
+<td class="small">{% for x in summary(g) %}<div>&#128205; {{ x }}</div>{% else %}<span class="mut">nichts</span>{% endfor %}</td>
+<td class="small">{{ members[g.id]|join(', ') or '–' }}</td><td><a class="btn" href="/benutzer/gruppe/{{ g.id }}">Bearbeiten</a></td></tr>
+{% else %}<tr><td colspan="5" class="mut">Noch keine Gruppen.</td></tr>{% endfor %}</table>
+<p><a class="btn acc" href="/benutzer/gruppe/neu">+ Gruppe</a> <a class="btn" href="/benutzer">Zu den Benutzern</a></p></div>{% endblock %}"""
+
+GROUP_T = """{% extends "base.html" %}{% block title %}{{ g.name or 'Neue Gruppe' }}{% endblock %}{% block body %}<div class="fit" style="min-width:min(780px,100%)">
+<h1>{{ g.name or 'Neue Gruppe' }}</h1><form method="post"><input type="hidden" name="csrf" value="{{csrf}}">
+<div class="card"><label>Name der Gruppe</label><input name="name" value="{{ g.name }}" required placeholder="z. B. Techniker Büro" style="max-width:360px"></div>
+<div class="card"><h2 style="margin-top:0">Was darf die Gruppe?</h2>{% set acts = g.actions %}{% set inherited = [] %}{% include "acts.html" %}</div>
+{% set pobj = g.perms %}{% set ptitle = 'Was sieht die Gruppe?' %}{% set phint = '' %}{% include "perms.html" %}
+<div class="card"><h2 style="margin-top:0">Mitglieder</h2>{% for u in us %}
+<label class="plain" style="display:block"><input type="checkbox" name="member" value="{{ u.name }}" {{ 'checked' if u.name in members }}> {{ u.display or u.name }}{% if u.source == 'ad' %} <span class="tag windows">AD</span>{% endif %}</label>
+{% else %}<span class="mut small">Noch keine Benutzer.</span>{% endfor %}</div>
+<p><button class="acc">Speichern</button> <a class="btn" href="/benutzer/gruppen">Zurück</a></p></form>
+{% if gid %}<form method="post" onsubmit="return confirm('Gruppe {{ g.name }} löschen? Die Mitglieder verlieren die Rechte dieser Gruppe.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="act" value="delete"><button class="danger">Gruppe löschen</button></form>{% endif %}
+</div><script>function tick(a,g){a.closest('.hl').querySelectorAll('input[type=checkbox]').forEach(function(c){c.checked = g==='*' || (g!=='' && c.dataset.g===g)});return false}</script>{% endblock %}"""
+
 def de_date(v):
     """ISO-Datum/Zeitstempel ("2026-11-18" / "2026-11-18 04:00:12") -> deutsch "18.11.2026" / "18.11.2026 04:00"."""
     m = re.match(r"^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}:\d{2}))?", str(v or ""))
@@ -2812,7 +2972,8 @@ def de_date(v):
 
 
 app.jinja_env.filters["de_date"] = de_date
-app.jinja_loader = DictLoader({"directory.html": DIRECTORY, "ad_add.html": AD_ADD, "invite.html": INVITE, "users.html": USERS, "user.html": USER, "password.html": PASSWORD, "forbidden.html": FORBIDDEN, "base.html": BASE, "login.html": LOGIN, "index.html": INDEX, "machine.html": MACHINE,
+app.jinja_env.filters["extract"] = lambda key, container: container.get(key, key) if hasattr(container, "get") else key
+app.jinja_loader = DictLoader({"perms.html": PERMS, "acts.html": ACTS, "groups.html": GROUPS_T, "group.html": GROUP_T, "directory.html": DIRECTORY, "ad_add.html": AD_ADD, "invite.html": INVITE, "users.html": USERS, "user.html": USER, "password.html": PASSWORD, "forbidden.html": FORBIDDEN, "base.html": BASE, "login.html": LOGIN, "index.html": INDEX, "machine.html": MACHINE,
                                "playbooks.html": PLAYBOOKS, "runs.html": RUNS, "run.html": RUN, "settings.html": SETTINGS,
                                "profile.html": PROFILE})
 
