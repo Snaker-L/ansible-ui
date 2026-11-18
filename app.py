@@ -306,12 +306,12 @@ def write_inventory():
     return path
 
 
-def new_run(kind, target, title):
+def new_run(kind, target, title, names=None):
     rid = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     with LOCK:
         runs = load("runs/index.json", [])
         runs.insert(0, {"id": rid, "kind": kind, "target": target, "title": title, "start": now(),
-                        "end": None, "status": "laeuft",
+                        "end": None, "status": "laeuft", **({"hosts": list(names)} if names else {}),
                         "user": session.get("user", "") if has_request_context() else "automatisch"})
         save("runs/index.json", runs[:500])
     return rid
@@ -895,6 +895,9 @@ def login_required(fn):
     def wrapper(*a, **kw):
         if not session.get("user"):
             return redirect(url_for("login", next=request.path))
+        if not is_admin() and not cur_user():  # Benutzer wurde geloescht
+            session.clear()
+            return redirect(url_for("login"))
         if request.method == "POST" and request.form.get("csrf") != session.get("csrf"):
             abort(400)
         return fn(*a, **kw)
@@ -903,7 +906,10 @@ def login_required(fn):
 
 @app.context_processor
 def ctx():
-    return {"csrf": session.get("csrf", ""), "groups": GROUPS, "locations": loc_names()}
+    if not session.get("user"):
+        return {"csrf": "", "groups": GROUPS, "locations": [], "admin": False, "can_run": False}
+    return {"csrf": session.get("csrf", ""), "groups": GROUPS, "locations": visible_locs(), "admin": is_admin(),
+            "can_run": can_run()}
 
 
 def check_admin(pw):
@@ -914,12 +920,134 @@ def check_admin(pw):
     return bool(ADMIN_PASSWORD) and secrets.compare_digest(pw, ADMIN_PASSWORD)
 
 
+# ---------------------------------------------------------------- Benutzer und Rechte
+# users.json: [{"name", "hash", "can_run": bool, "perms": {"<Standort>": "*" | ["<Maschine>", ...]}, "created", "changed"}]
+# Der Admin (ADMIN_USER) steht nicht in users.json und sieht/darf alles.
+def users_data():
+    return load("users.json", [])
+
+
+def find_user(name):
+    return next((u for u in users_data() if u["name"] == name), None)
+
+
+def is_admin():
+    return session.get("user") == ADMIN_USER and session.get("role", "admin") == "admin"
+
+
+def cur_user():
+    return None if is_admin() else find_user(session.get("user", ""))
+
+
+def can_see(h, u=None):
+    if u is None:
+        if is_admin():
+            return True
+        u = cur_user()
+    if not u:
+        return False
+    v = (u.get("perms") or {}).get(h.get("location") or "")
+    return v == "*" or (isinstance(v, list) and h["name"] in v)
+
+
+def visible_hosts():
+    hs = hosts()
+    if is_admin():
+        return hs
+    u = cur_user()
+    return [h for h in hs if can_see(h, u)]
+
+
+def visible_locs():
+    if is_admin():
+        return loc_names()
+    names = {h.get("location") or "" for h in visible_hosts()}
+    return [x for x in loc_names() if x in names]
+
+
+def can_run():
+    return is_admin() or bool((cur_user() or {}).get("can_run"))
+
+
+def run_hosts(r):
+    """Maschinen eines Laufs: gespeichert (neu) oder aus dem Ziel abgeleitet (Name, Namensliste, Gruppe, all)."""
+    if r.get("hosts"):
+        return set(r["hosts"])
+    hs = hosts()
+    out = set()
+    for t in str(r.get("target", "")).split(","):
+        t = t.strip()
+        if t == "all":
+            return {h["name"] for h in hs}
+        if t in GROUPS:
+            out |= {h["name"] for h in hs if h["group"] == t}
+        elif any(h["name"] == t for h in hs):
+            out.add(t)
+    return out
+
+
+def can_see_run(r):
+    if is_admin():
+        return True
+    names = run_hosts(r)
+    vis = {h["name"] for h in visible_hosts()}
+    return bool(names) and names <= vis
+
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        if not is_admin():
+            abort(403)
+        return fn(*a, **kw)
+    return login_required(wrapper)
+
+
+def run_required(fn):
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        if not can_run():
+            abort(403)
+        return fn(*a, **kw)
+    return login_required(wrapper)
+
+
+def rename_in_perms(kind, old, new):
+    """Standort/Maschine umbenannt (new) oder geloescht (new=None): Rechte der Benutzer nachziehen."""
+    with LOCK:
+        us = users_data()
+        changed = False
+        for u in us:
+            pm = u.get("perms") or {}
+            if kind == "location" and old in pm:
+                v = pm.pop(old)
+                if new is not None:
+                    pm[new] = v
+                changed = True
+            elif kind == "host":
+                for k, v in pm.items():
+                    if isinstance(v, list) and old in v:
+                        pm[k] = [x for x in v if x != old] + ([new] if new else [])
+                        changed = True
+            u["perms"] = pm
+        if changed:
+            save("users.json", us, 0o600)
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        if request.form.get("user") == ADMIN_USER and check_admin(request.form.get("password", "")):
+        un, pw = request.form.get("user", ""), request.form.get("password", "")
+        u = find_user(un) if un != ADMIN_USER else None
+        if u and check_password_hash(u["hash"], pw):
             session.clear()
-            session.update(user=ADMIN_USER, csrf=secrets.token_hex(16))
+            session.update(user=u["name"], role="user", csrf=secrets.token_hex(16))
+            session.permanent = True
+            nxt = request.args.get("next", "/")
+            return redirect(nxt if nxt.startswith("/") else "/")
+        if un == ADMIN_USER and check_admin(pw):
+            session.clear()
+            session.update(user=ADMIN_USER, role="admin", csrf=secrets.token_hex(16))
             session.permanent = True
             nxt = request.args.get("next", "/")
             return redirect(nxt if nxt.startswith("/") else "/")
@@ -939,7 +1067,7 @@ def index():
     st = load("status.json", {})
     sec = profiles_data()
     rows = []
-    for h in hosts():
+    for h in visible_hosts():
         pr = profile_for(h, sec)
         rows.append({**h, "st": st.get(h["name"], {}), "sum": summary(facts_of(h["name"])), "addrs": addr_list(h),
                      "prof": pr["name"] if pr else "kein Profil", "prof_own": bool(h.get("profile"))})
@@ -951,7 +1079,7 @@ def index():
         r["skey"] = status_key(r, r["st"])
         r["ukeys"] = upd_keys(r, r["st"])
     counts = {x: sum(1 for r in rows if r.get("location") == x and (not grp or r["group"] == grp)
-                     and (not stat or r["skey"] == stat) and (not updf or updf in r["ukeys"])) for x in loc_names()}
+                     and (not stat or r["skey"] == stat) and (not updf or updf in r["ukeys"])) for x in visible_locs()}
     if grp:
         rows = [r for r in rows if r["group"] == grp]
     if loc:
@@ -962,7 +1090,7 @@ def index():
     ucounts = {k: sum(1 for r in rows if k in r["ukeys"]) for k in UPD_LABELS}
     if updf:
         rows = [r for r in rows if updf in r["ukeys"]]
-    running = [r for r in load("runs/index.json", []) if r["status"] == "laeuft"]
+    running = [r for r in load("runs/index.json", []) if r["status"] == "laeuft" and can_see_run(r)]
     allruns = load("runs/index.json", [])
     for r in rows:  # letzter Update-/Check-Lauf der Maschine: Fehler sichtbar lassen, bis ein spaeterer Lauf klappt
         last = next((x for x in allruns if x["kind"] in ("playbook", "upgrade", "reboot") and x["status"] != "laeuft"
@@ -997,7 +1125,8 @@ def index():
                                      and (r["st"].get("upd") or {}).get("ok") and r["st"]["upd"].get("count")),
                            upd_rows=[r for r in rows if r.get("enabled", True) and r.get("address")
                                      and (r["st"].get("upd") or {}).get("ok") and r["st"]["upd"].get("count")],
-                           plans=sorted(load("schedule.json", []), key=lambda x: x["when"]),
+                           plans=sorted([x for x in load("schedule.json", []) if is_admin()
+                                         or set(x["names"]) <= {h["name"] for h in visible_hosts()}], key=lambda x: x["when"]),
                            now_min=datetime.datetime.now().strftime("%Y-%m-%dT%H:%M"),
                            disp={h["name"]: display_name(h) for h in hosts()})
 
@@ -1057,7 +1186,7 @@ app.jinja_env.globals["qs"] = qs
 
 
 @app.post("/aktion")
-@login_required
+@run_required
 def action():
     kind = request.form.get("kind")
     target = request.form.get("target", "")
@@ -1065,7 +1194,7 @@ def action():
     updf = request.form.get("updates", "")
     if kind not in ("ping", "facts", "updates"):
         abort(400)
-    act = [h for h in hosts() if h.get("enabled", True) and h.get("address")]
+    act = [h for h in visible_hosts() if h.get("enabled", True) and h.get("address")]
     if target and target != "all":
         names = [h["name"] for h in act if h["name"] == target or h["group"] == target]
     else:
@@ -1078,7 +1207,7 @@ def action():
         flash("Keine aktive Maschine mit Adresse ausgewaehlt.", "err")
         return redirect(request.referrer or "/")
     title = {"ping": "Ping", "facts": "Info Device", "updates": "Updates prüfen"}[kind] + ": " + (target or "alle")
-    rid = new_run(kind, target or "all", title)
+    rid = new_run(kind, target or "all", title, names)
     if kind == "updates":
         start(updates_job, rid, names)
         flash(f"{title} gestartet - dauert je nach System einige Sekunden bis Minuten (Windows Update ist langsam).", "ok")
@@ -1089,7 +1218,7 @@ def action():
 
 
 @app.post("/upgrade")
-@login_required
+@admin_required
 def upgrade_action():
     name = request.form.get("target", "")
     h = next((x for x in hosts() if x["name"] == name and x.get("enabled", True) and x.get("address")), None)
@@ -1112,14 +1241,14 @@ def upgrade_action():
 
 
 @app.post("/neustart")
-@login_required
+@run_required
 def reboot_action():
     """Neustart einer Maschine oder aller (gefilterten) Maschinen, die einen Neustart brauchen."""
     target = request.form.get("target", "")
     grp, loc, stat = request.form.get("gruppe", ""), request.form.get("standort", ""), request.form.get("status", "")
     updf = request.form.get("updates", "")
     st = load("status.json", {})
-    act = [h for h in hosts() if h.get("enabled", True) and h.get("address")]
+    act = [h for h in visible_hosts() if h.get("enabled", True) and h.get("address")]
     if target:
         sel = [h for h in act if h["name"] == target]
     else:
@@ -1132,7 +1261,7 @@ def reboot_action():
         return redirect(request.referrer or "/")
     names = [h["name"] for h in sel]
     title = "Neustart: " + (display_name(sel[0]) if target else f"{len(names)} Maschine(n) nacheinander")
-    rid = new_run("reboot", ",".join(names), title)
+    rid = new_run("reboot", ",".join(names), title, names)
     start(reboot_job, rid, names)
     flash(f"{title} gestartet – Ansible wartet jeweils, bis die Maschine wieder erreichbar ist.", "ok")
     return redirect(request.referrer or "/")
@@ -1147,14 +1276,14 @@ def launch_mass(kind, sel, label):
         if not names or pb not in playbooks():
             continue
         title = f"{'Check' if kind == 'check' else 'Update'} {g} ({label}): {len(names)} Maschine(n)"
-        rid = new_run("playbook", ",".join(names), title + (" (Probelauf)" if kind == "check" else ""))
+        rid = new_run("playbook", ",".join(names), title + (" (Probelauf)" if kind == "check" else ""), names)
         start(playbook_job, rid, pb, ",".join(names), kind == "check")
         started.append(f"{g}: {len(names)}")
     return started
 
 
 @app.post("/massen")
-@login_required
+@run_required
 def mass_action():
     """Check (Probelauf) oder Update fuer alle bzw. die gefilterte Auswahl; Update nur dort, wo Updates offen sind.
     Aus dem Update-Dialog (pick=1): explizit angehakte Maschinen, sofort oder geplant (when)."""
@@ -1167,7 +1296,7 @@ def mass_action():
     label = " / ".join(x for x in (loc, STATUS_LABELS.get(stat, ""), UPD_LABELS.get(updf, "")) if x) or "alle"
     if kind == "update" and request.form.get("pick"):
         picked = set(request.form.getlist("host"))
-        sel = [h for h in hosts() if h.get("enabled", True) and h.get("address") and h["name"] in picked]
+        sel = [h for h in visible_hosts() if h.get("enabled", True) and h.get("address") and h["name"] in picked]
         if not sel:
             flash("Keine Maschine angehakt.", "err")
             return redirect(request.referrer or "/")
@@ -1189,7 +1318,7 @@ def mass_action():
             return redirect(request.referrer or "/")
         started = launch_mass("update", sel, "Auswahl")
     else:
-        sel = [h for h in hosts() if h.get("enabled", True) and h.get("address") and (not grp or h["group"] == grp)
+        sel = [h for h in visible_hosts() if h.get("enabled", True) and h.get("address") and (not grp or h["group"] == grp)
                and (not loc or h.get("location") == loc) and (not stat or status_key(h, st.get(h["name"], {})) == stat)
                and (not updf or updf in upd_keys(h, st.get(h["name"], {})))]
         if kind == "update":
@@ -1205,11 +1334,13 @@ def mass_action():
 
 
 @app.post("/geplant/loeschen")
-@login_required
+@run_required
 def plan_delete():
     pid = request.form.get("id", "")
+    vis = {h["name"] for h in visible_hosts()}
     with LOCK:
-        save("schedule.json", [x for x in load("schedule.json", []) if x["id"] != pid])
+        save("schedule.json", [x for x in load("schedule.json", []) if x["id"] != pid
+                               or not (is_admin() or set(x["names"]) <= vis)])
     flash("Geplanter Update-Lauf gelöscht.", "ok")
     return redirect(request.referrer or "/")
 
@@ -1246,6 +1377,10 @@ def schedule_loop():
 @app.route("/maschine/<name>", methods=["GET", "POST"])
 @login_required
 def machine(name=None):
+    if (request.method == "POST" or not name) and not is_admin():
+        abort(403)
+    if name and not can_see(host(name)):
+        abort(404)
     h = host(name) if name else {"name": "", "address": "", "group": "linux", "user": "root", "port": 22,
                                  "enabled": True, "notes": "", "location": request.args.get("standort") or loc_names()[0]}
     if request.method == "POST":
@@ -1255,6 +1390,7 @@ def machine(name=None):
                 st = load("status.json", {})
                 st.pop(name, None)
                 save("status.json", st)
+            rename_in_perms("host", name, None)
             try:
                 os.unlink(p("facts", name + ".json"))
             except FileNotFoundError:
@@ -1303,6 +1439,7 @@ def machine(name=None):
             all_h = [x for x in all_h if x["name"] != name] + [new]
             save("hosts.json", all_h)
             if name and name != new["name"]:
+                rename_in_perms("host", name, new["name"])
                 st = load("status.json", {})
                 if name in st:
                     st[new["name"]] = st.pop(name)
@@ -1313,8 +1450,11 @@ def machine(name=None):
         return redirect(url_for("machine", name=new["name"]))
     f = facts_of(name) if name else {}
     st = load("status.json", {}).get(name, {}) if name else {}
-    runs = [r for r in load("runs/index.json", []) if name and r["target"] in (name, h["group"], "all")][:15]
+    runs = [r for r in load("runs/index.json", []) if name and (name in run_hosts(r) if r.get("hosts") else r["target"] in (name, h["group"], "all"))
+            and can_see_run(r)][:15]
     pbs = playbooks_for(h) if name else []
+    if not is_admin():  # Benutzer: nur die Update-Playbooks
+        pbs = [x for x in pbs if x.startswith("updates-installieren-")]
     return render_template("machine.html", h=h, name=name, f=f, s=summary(f), st=st, playbooks=pbs,
                            pb_default=f"updates-installieren-{h['group']}.yml", runs=runs, profiles=profiles_data(), plabel=profile_label(profile_for(h)) if name else "", facts_json=json.dumps(f, indent=1, ensure_ascii=False, default=str)[:400000])
 
@@ -1347,7 +1487,7 @@ def playbooks_for(h):
 
 
 @app.route("/playbooks", methods=["GET", "POST"])
-@login_required
+@admin_required
 def playbook_list():
     if request.method == "POST":
         fn = request.form.get("filename", "").strip()
@@ -1380,17 +1520,21 @@ def playbook_list():
 
 
 @app.post("/playbook/start")
-@login_required
+@run_required
 def playbook_start():
     pb = request.form.get("playbook", "")
     target = request.form.get("target", "")
     if pb not in playbooks():
         abort(400)
-    valid = {"all", *GROUPS, *(h["name"] for h in hosts() if h.get("enabled", True))}
+    if is_admin():
+        valid = {"all", *GROUPS, *(h["name"] for h in hosts() if h.get("enabled", True))}
+    else:  # Benutzer: nur Update-Playbooks auf einzelne sichtbare Maschinen
+        valid = {h["name"] for h in visible_hosts() if h.get("enabled", True)} if pb.startswith("updates-installieren-") else set()
     if target not in valid:
-        abort(400)
+        abort(400 if is_admin() else 403)
     check = bool(request.form.get("check"))
-    rid = new_run("playbook", target, f"{pb} auf {target}" + (" (Probelauf)" if check else ""))
+    rid = new_run("playbook", target, f"{pb} auf {target}" + (" (Probelauf)" if check else ""),
+                  [target] if target not in ("all", *GROUPS) else None)
     start(playbook_job, rid, pb, target, check)
     return redirect(url_for("run_view", rid=rid))
 
@@ -1398,7 +1542,7 @@ def playbook_start():
 @app.route("/laeufe")
 @login_required
 def runs():
-    return render_template("runs.html", runs=load("runs/index.json", [])[:200])
+    return render_template("runs.html", runs=[r for r in load("runs/index.json", []) if can_see_run(r)][:200])
 
 
 @app.route("/laeufe/<rid>")
@@ -1407,19 +1551,19 @@ def run_view(rid):
     if not re.match(r"^[0-9a-f-]+$", rid):
         abort(404)
     r = next((x for x in load("runs/index.json", []) if x["id"] == rid), None)
-    if not r:
+    if not r or not can_see_run(r):
         abort(404)
     try:
         with open(p("runs", rid + ".log")) as f:
             text = f.read()[-300000:]
     except FileNotFoundError:
         text = ""
-    back = next((h for h in hosts() if h["name"] == r.get("target")), None)
+    back = next((h for h in visible_hosts() if h["name"] == r.get("target")), None)
     return render_template("run.html", r=r, text=text, back=back)
 
 
 @app.route("/einstellungen", methods=["GET", "POST"])
-@login_required
+@admin_required
 def settings():
     sec = load("secrets.json", {})
     if request.method == "POST" and request.form.get("form") == "password":
@@ -1524,6 +1668,7 @@ def location_action(f):
                     if h.get("location") == old:
                         h["location"] = name
                 save("hosts.json", hs)
+                rename_in_perms("location", old, name)
             flash(f"Standort „{name}“ gespeichert.", "ok")
         elif act in ("up", "down"):
             j = idx - 1 if act == "up" else idx + 1
@@ -1546,12 +1691,13 @@ def location_action(f):
                 save("hosts.json", hs)
             del locs[idx]
             save("locations.json", locs)
+            rename_in_perms("location", old, None)
             flash(f"Standort „{old}“ gelöscht" + (f", {len(affected)} Maschine(n) nach „{target}“ verschoben." if affected else "."), "ok")
 
 
 @app.route("/profil/neu", methods=["GET", "POST"])
 @app.route("/profil/<pid>", methods=["GET", "POST"])
-@login_required
+@admin_required
 def profile_edit(pid=None):
     sec = profiles_data()
     pr = next((x for x in sec["profiles"] if x["id"] == pid), None) if pid else blank_profile(request.args.get("typ", "linux"))
@@ -1617,6 +1763,111 @@ def profile_edit(pid=None):
     return render_template("profile.html", pr=pr, pid=pid)
 
 
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{1,40}$")
+
+
+def pw_problem(new, rep_):
+    if len(new) < 10:
+        return "Das Passwort muss mindestens 10 Zeichen haben."
+    if new != rep_:
+        return "Die beiden Passwörter stimmen nicht überein."
+    return None
+
+
+def perms_summary(u):
+    out = []
+    for loc, v in (u.get("perms") or {}).items():
+        out.append(f"{loc or 'ohne Standort'}: " + ("alle" if v == "*" else f"{len(v)} Maschine(n)"))
+    return out
+
+
+@app.route("/benutzer")
+@admin_required
+def user_list():
+    return render_template("users.html", users=users_data(), summary=perms_summary)
+
+
+@app.route("/benutzer/neu", methods=["GET", "POST"])
+@app.route("/benutzer/<uname>", methods=["GET", "POST"])
+@admin_required
+def user_edit(uname=None):
+    u = find_user(uname) if uname else {"name": "", "can_run": False, "perms": {}}
+    if u is None:
+        abort(404)
+    hs = hosts()
+    locs = loc_names() + ([""] if any(not h.get("location") for h in hs) else [])
+    if request.method == "POST":
+        if request.form.get("delete") and uname:
+            with LOCK:
+                save("users.json", [x for x in users_data() if x["name"] != uname], 0o600)
+            flash(f"Benutzer {uname} gelöscht.", "ok")
+            return redirect(url_for("user_list"))
+        name = uname or request.form.get("name", "").strip()
+        perms = {}
+        for i, loc in enumerate(locs):
+            mode = request.form.get(f"m{i}", "")
+            if mode == "all":
+                perms[loc] = "*"
+            elif mode == "sel":
+                names = [x for x in request.form.getlist(f"h{i}")
+                         if any(h["name"] == x and (h.get("location") or "") == loc for h in hs)]
+                if names:
+                    perms[loc] = names
+        new_pw, rep_ = request.form.get("password", ""), request.form.get("password2", "")
+        err = None
+        if not uname and (not USERNAME_RE.match(name) or name == ADMIN_USER or find_user(name)):
+            err = "Benutzername ungültig oder schon vergeben (2–41 Zeichen: Buchstaben, Ziffern, . _ @ -)."
+        elif (new_pw or not uname) and pw_problem(new_pw, rep_):
+            err = pw_problem(new_pw, rep_)
+        if err:
+            flash(err, "err")
+            return render_template("user.html", u={"name": name, "can_run": bool(request.form.get("can_run")), "perms": perms},
+                                   uname=uname, locs=locs, hs=hs)
+        with LOCK:
+            us = users_data()
+            cur = next((x for x in us if x["name"] == name), None)
+            if cur is None:
+                cur = {"name": name, "created": now()}
+                us.append(cur)
+            cur.update(can_run=bool(request.form.get("can_run")), perms=perms, changed=now())
+            if new_pw:
+                cur["hash"] = generate_password_hash(new_pw)
+            save("users.json", us, 0o600)
+        flash(f"Benutzer {name} gespeichert." + ("" if perms else " Achtung: noch keine Standorte freigegeben – sieht nichts."),
+              "ok" if perms else "err")
+        return redirect(url_for("user_edit", uname=name))
+    return render_template("user.html", u=u, uname=uname, locs=locs, hs=hs)
+
+
+@app.route("/passwort", methods=["GET", "POST"])
+@login_required
+def own_password():
+    if is_admin():
+        return redirect(url_for("settings") + "#passwort")
+    if request.method == "POST":
+        u = cur_user()
+        old, new, rep_ = (request.form.get(k, "") for k in ("old_password", "new_password", "new_password2"))
+        if not check_password_hash(u["hash"], old):
+            flash("Aktuelles Passwort ist falsch.", "err")
+        elif pw_problem(new, rep_):
+            flash(pw_problem(new, rep_), "err")
+        else:
+            with LOCK:
+                us = users_data()
+                for x in us:
+                    if x["name"] == u["name"]:
+                        x["hash"], x["changed"] = generate_password_hash(new), now()
+                save("users.json", us, 0o600)
+            flash("Passwort geändert.", "ok")
+            return redirect("/")
+    return render_template("password.html")
+
+
+@app.errorhandler(403)
+def forbidden(_e):
+    return render_template("forbidden.html"), 403
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -1675,8 +1926,8 @@ input[type=checkbox],input[type=radio]{width:auto}
 .spin{display:inline-block;animation:spin 1.2s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 </style></head><body>
 {% if session.user %}<header><b>&#9881; Ansible-UI</b><nav>
-<a href="/">Maschinen</a><a href="/playbooks">Playbooks</a><a href="/laeufe">Läufe</a><a href="/einstellungen">Einstellungen</a></nav>
-<span class="sp"></span><span class="mut">{{ session.user }}</span><a href="/logout">Abmelden</a></header>{% endif %}
+<a href="/">Maschinen</a>{% if admin %}<a href="/playbooks">Playbooks</a>{% endif %}<a href="/laeufe">Läufe</a>{% if admin %}<a href="/einstellungen">Einstellungen</a><a href="/benutzer">Benutzer</a>{% endif %}</nav>
+<span class="sp"></span><span class="mut">{{ session.user }}{% if not admin %} <a href="/passwort" class="small">Passwort</a>{% endif %}</span><a href="/logout">Abmelden</a></header>{% endif %}
 <main>{% for cat,m in get_flashed_messages(with_categories=true) %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}
 {% block body %}{% endblock %}</main></body></html>"""
 
@@ -1697,6 +1948,7 @@ INDEX = """{% extends "base.html" %}{% block title %}Maschinen{% endblock %}
  <a class="btn {{ 'acc' if not grp }}" href="{{ qs(standort=loc, status=stat, updates=updf) }}">Alle</a>
  {% for g in groups %}<a class="btn {{ 'acc' if grp==g }}" href="{{ qs(gruppe=g, standort=loc, status=stat, updates=updf) }}">{{ g|capitalize }}</a>{% endfor %}
  <span style="flex:1"></span>
+ {% if can_run %}
  <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}">
   <input type="hidden" name="kind" value="ping"><input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button>{{ 'Alle' if not (grp or loc or stat or updf) else 'Auswahl' }} pingen</button></form>
  <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}">
@@ -1708,9 +1960,9 @@ INDEX = """{% extends "base.html" %}{% block title %}Maschinen{% endblock %}
  <button type="button" class="acc" {{ 'disabled' if not upd_rows }} title="Maschinen auswählen, sofort oder geplant" onclick="document.getElementById('dlg-upd').showModal();updCount()">Update {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }} ({{ n_upd }})</button>
  {% if n_reboot %}<form class="inl" method="post" action="/neustart" onsubmit="return confirm('{{ n_reboot }} Maschine(n) nacheinander neu starten? Jede ist dabei ein paar Minuten nicht erreichbar.')"><input type="hidden" name="csrf" value="{{csrf}}">
   <input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button class="danger" title="nur Maschinen mit „Neustart nötig“, nacheinander">Neustart {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }} ({{ n_reboot }})</button></form>{% endif %}
- <a class="btn acc" href="/maschine/neu{{ ('?standort=' ~ loc) if loc }}">+ Maschine</a>
+ {% endif %}{% if admin %}<a class="btn acc" href="/maschine/neu{{ ('?standort=' ~ loc) if loc }}">+ Maschine</a>{% endif %}
 </div>
-{% for pl in plans %}<div class="flash plan"><form class="inl" method="post" action="/geplant/loeschen" style="float:right;margin-left:12px"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="id" value="{{ pl.id }}"><button class="small" onclick="return confirm('Geplanten Update-Lauf {{ pl.when }} entfernen?')">{{ 'Löschen' if pl.status == 'geplant' else 'Ausblenden' }}</button></form>
+{% for pl in plans %}<div class="flash plan">{% if can_run %}<form class="inl" method="post" action="/geplant/loeschen" style="float:right;margin-left:12px"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="id" value="{{ pl.id }}"><button class="small" onclick="return confirm('Geplanten Update-Lauf {{ pl.when }} entfernen?')">{{ 'Löschen' if pl.status == 'geplant' else 'Ausblenden' }}</button></form>{% endif %}
  &#128339; {% if pl.status == 'geplant' %}Geplant{% elif pl.status == 'gestartet' %}Gestartet{% else %}<span class="st-err">Verpasst</span>{% endif %}: Update am <b>{{ pl.when[8:10] }}.{{ pl.when[5:7] }}.{{ pl.when[:4] }} um {{ pl.when[11:] }}</b> – {{ pl.names|length }} Maschine(n)
  <div class="small mut">{% for n in pl.names %}{{ disp.get(n, n) }}{% if not loop.last %}, {% endif %}{% endfor %}{% if pl.status == 'verpasst' %} · nicht ausgeführt, Container war zum Zeitpunkt nicht aktiv{% endif %}</div></div>{% endfor %}
 <dialog id="dlg-upd"><form method="post" action="/massen" onsubmit="return updSubmit(this)"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="update"><input type="hidden" name="pick" value="1">
@@ -1768,13 +2020,13 @@ function updSubmit(f){var n=f.querySelectorAll('.updh:checked').length;if(!n)ret
  {% if u and u.release and u.release.new %}<div style="color:#7cb7ff" title="aktuell: {{ u.release.cur }}">&#11014; {{ u.release.new }} verfügbar</div>{% endif %}
  {% if u %}<div class="mut" title="{{ u.stale or '' }}">{{ u.time[:16] }}{% if u.stale %} *{% endif %}</div>{% endif %}
 </div>
- {% set pb = 'updates-installieren-' ~ r.group ~ '.yml' %}{% if r.enabled and r.address and pb in pbs %}
+ {% set pb = 'updates-installieren-' ~ r.group ~ '.yml' %}{% if r.enabled and r.address and pb in pbs and can_run %}
  <div style="white-space:nowrap;text-align:center"><div><form class="inl" method="post" action="/playbook/start"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="playbook" value="{{ pb }}"><input type="hidden" name="target" value="{{ r.name }}"><input type="hidden" name="check" value="1"><button title="Probelauf: zeigt, was installiert würde">Check</button></form>
  {% if u and u.ok and u.count %}<form class="inl" method="post" action="/playbook/start" onsubmit="return confirm('{{ u.count }} Update(s) auf {{ r.display or r.name }} jetzt installieren?{{ ' (Windows: kann dauern, Programme vorher schließen)' if r.group == 'windows' }}')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="playbook" value="{{ pb }}"><input type="hidden" name="target" value="{{ r.name }}"><button class="acc" title="Updates installieren (ohne Neustart)">Update</button></form>{% endif %}
  {% if u and u.reboot %}<form class="inl" method="post" action="/neustart" onsubmit="return confirm('{{ r.display or r.name }} jetzt neu starten?{{ ' ACHTUNG: Docker-Host bzw. nur-einzeln-Maschine – dabei sind alle Dienste darauf weg, auch diese Seite.' if r.no_mass }}')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ r.name }}"><button class="danger" title="Maschine neu starten">Neustart</button></form>{% endif %}
- {% if u and u.release and u.release.new and r.group == 'linux' and 'pve' not in (r.sum.kernel or '') %}<form class="inl" method="post" action="/upgrade" onsubmit="return confirm('Distributions-Upgrade von {{ r.display or r.name }} auf {{ u.release.new }} starten?\n\nVORHER einen Snapshot bzw. ein Backup machen!\nDauert 20–60 Minuten, die Maschine startet dabei neu und ist zeitweise nicht erreichbar.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ r.name }}"><button style="background:#1f3b63;border-color:#2f5b93" title="auf {{ u.release.new }} aktualisieren">Upgrade</button></form>{% endif %}</div>{% if r.no_mass %}<div class="mut" title="wird bei „Update alle“ ausgelassen">nur einzeln</div>{% endif %}</div>{% endif %}</div></td>
+ {% if admin and u and u.release and u.release.new and r.group == 'linux' and 'pve' not in (r.sum.kernel or '') %}<form class="inl" method="post" action="/upgrade" onsubmit="return confirm('Distributions-Upgrade von {{ r.display or r.name }} auf {{ u.release.new }} starten?\n\nVORHER einen Snapshot bzw. ein Backup machen!\nDauert 20–60 Minuten, die Maschine startet dabei neu und ist zeitweise nicht erreichbar.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ r.name }}"><button style="background:#1f3b63;border-color:#2f5b93" title="auf {{ u.release.new }} aktualisieren">Upgrade</button></form>{% endif %}</div>{% if r.no_mass %}<div class="mut" title="wird bei „Update alle“ ausgelassen">nur einzeln</div>{% endif %}</div>{% endif %}</div></td>
 <td class="small" style="white-space:nowrap" title="{{ r.st.ping_time or '' }}">{% if r.st.ping_time %}{{ r.st.ping_time[8:10] }}.{{ r.st.ping_time[5:7] }}. {{ r.st.ping_time[11:16] }}{% else %}–{% endif %}{% if r.st.ping_msg and not r.st.ping_ok %}<div class="st-err" style="white-space:normal;max-width:220px">{{ r.st.ping_msg }}</div>{% endif %}</td>
-<td style="white-space:nowrap">{% if r.enabled and r.address %}
+<td style="white-space:nowrap">{% if r.enabled and r.address and can_run %}
  <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="ping"><input type="hidden" name="target" value="{{ r.name }}"><button>Ping</button></form>
  <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="facts"><input type="hidden" name="target" value="{{ r.name }}"><button>Info</button></form>
  <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="updates"><input type="hidden" name="target" value="{{ r.name }}"><button title="Updates suchen (installiert nichts)">Updates</button></form>{% endif %}
@@ -1788,19 +2040,19 @@ MACHINE = """{% extends "base.html" %}{% block title %}{{ (h.display or name) if
  {% if st.ping_time %}<span class="dot {{ 'ok' if st.ping_ok else 'err' }}"></span>{{ 'erreichbar' if st.ping_ok else st.ping_msg }}<div class="mut small">{{ st.ping_time }}</div>{% else %}<span class="mut">noch nie geprüft</span>{% endif %}
  <div class="mut small">Info Device: {{ st.facts_time or 'noch keine' }}</div>
  {% if st.via %}<div class="small {{ 'mut' if st.via.ok else 'st-err' }}">{{ ('zuletzt erreicht über ' ~ st.via.addr) if st.via.ok else 'keine der Adressen erreichbar' }} ({{ st.via.time }})</div>{% endif %}
- <p>{% if h.enabled and h.address %}
+ <p>{% if h.enabled and h.address and can_run %}
  <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="ping"><input type="hidden" name="target" value="{{ name }}"><button>Ping</button></form>
  <form class="inl" method="post" action="/aktion"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="facts"><input type="hidden" name="target" value="{{ name }}"><button>Info Device</button></form>{% endif %}</p></div>
-<div class="card"><h2 style="margin-top:0">System</h2><div class="small mut">Zugang: {{ plabel }}</div>{% if s %}
+<div class="card"><h2 style="margin-top:0">System</h2>{% if admin %}<div class="small mut">Zugang: {{ plabel }}</div>{% endif %}{% if s %}
  <div>{{ s.os }}</div><div class="mut small">{{ s.hostname }}</div>
  <div class="small">Kernel {{ s.kernel }} · {{ s.arch }} · {{ s.virt }}</div>
  <div class="small">{{ s.cpu }} vCPU · {{ s.ram }} RAM · läuft seit {{ s.uptime }}</div>
  <div class="small mut">IPs: {{ s.ips }}</div>{% else %}<span class="mut">Noch keine Infos – „Info Device“ drücken.</span>{% endif %}</div>
-<div class="card"><h2 style="margin-top:0">Playbook ausführen</h2>
+{% if can_run %}<div class="card"><h2 style="margin-top:0">{{ 'Playbook ausführen' if admin else 'Updates installieren' }}</h2>
  {% if playbooks and h.enabled and h.address %}<form method="post" action="/playbook/start"><input type="hidden" name="csrf" value="{{csrf}}">
  <input type="hidden" name="target" value="{{ name }}"><select name="playbook">{% for pb in playbooks %}<option {{ 'selected' if pb == pb_default }}>{{pb}}</option>{% endfor %}</select>
  <label><input type="checkbox" name="check" value="1" style="width:auto" checked> nur Probelauf (--check)</label>
- <p><button class="acc">Starten</button></p></form>{% else %}<span class="mut">{{ 'Maschine inaktiv oder ohne Adresse.' if playbooks else 'Kein Playbook für ' ~ h.group ~ ' vorhanden.' }}</span>{% endif %}</div>
+ <p><button class="acc">Starten</button></p></form>{% else %}<span class="mut">{{ 'Maschine inaktiv oder ohne Adresse.' if playbooks else 'Kein Playbook für ' ~ h.group ~ ' vorhanden.' }}</span>{% endif %}</div>{% endif %}
 </div>
 <div class="card" id="updates"><h2 style="margin-top:0">Updates</h2>{% set u = st.upd %}
  {% if not u %}<span class="mut">Noch nicht geprüft.</span>
@@ -1809,15 +2061,15 @@ MACHINE = """{% extends "base.html" %}{% block title %}{{ (h.display or name) if
  {% if u.reboot %} · <span class="st-warn">Neustart nötig</span>{% endif %}</div>
  <div class="mut small">Geprüft {{ u.time }} über {{ u.pm }}{% if u.stale %} · letzter Versuch {{ u.stale }}{% endif %}</div>
  {% if u.release %}<div class="small" style="margin-top:4px">Version: {{ u.release.cur or s.os }}{% if u.release.new %} · <b style="color:#7cb7ff">&#11014; {{ u.release.new }} verfügbar</b> <span class="mut">(Distributions-Upgrade, nicht in den normalen Updates enthalten)</span>
- {% if h.group == 'linux' and 'pve' not in (s.kernel or '') and h.enabled and h.address %}<form class="inl" method="post" action="/upgrade" onsubmit="return confirm('Distributions-Upgrade auf {{ u.release.new }} starten?\n\nVORHER einen Snapshot bzw. ein Backup machen!\nDauert 20–60 Minuten, die Maschine startet dabei neu.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ name }}"><button style="background:#1f3b63;border-color:#2f5b93">Upgrade auf {{ u.release.new }}</button></form>{% endif %}{% else %} · <span class="st-ok">neueste Version</span>{% endif %}</div>{% endif %}
+ {% if admin and h.group == 'linux' and 'pve' not in (s.kernel or '') and h.enabled and h.address %}<form class="inl" method="post" action="/upgrade" onsubmit="return confirm('Distributions-Upgrade auf {{ u.release.new }} starten?\n\nVORHER einen Snapshot bzw. ein Backup machen!\nDauert 20–60 Minuten, die Maschine startet dabei neu.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="target" value="{{ name }}"><button style="background:#1f3b63;border-color:#2f5b93">Upgrade auf {{ u.release.new }}</button></form>{% endif %}{% else %} · <span class="st-ok">neueste Version</span>{% endif %}</div>{% endif %}
  {% if u.warn %}<div class="st-warn small">{{ u.warn }}</div>{% endif %}
  {% if u['items'] %}<details {{ 'open' if u['items']|length <= 15 }} style="margin-top:8px"><summary class="mut">Liste ({{ u['items']|length }})</summary>
  <table style="margin-top:6px"><tr><th>Paket / Update</th><th>Installiert</th><th>Neu</th><th></th></tr>
  {% for i in u['items'] %}<tr><td>{{ i.name }}</td><td class="small mut">{{ i.from }}</td><td class="small">{{ i.to }}</td><td>{% if i.sec %}<span class="tag sec">Sicherheit</span>{% endif %}</td></tr>{% endfor %}</table></details>{% endif %}
  {% endif %}
- {% if h.enabled and h.address %}<form method="post" action="/aktion" style="margin-top:10px"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="updates"><input type="hidden" name="target" value="{{ name }}"><button>Updates prüfen</button> <span class="mut small">sucht nur – installiert wird mit einem Playbook (z. B. updates-installieren-{{ h.group }}.yml)</span></form>{% endif %}
+ {% if h.enabled and h.address and can_run %}<form method="post" action="/aktion" style="margin-top:10px"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="updates"><input type="hidden" name="target" value="{{ name }}"><button>Updates prüfen</button> <span class="mut small">sucht nur – installiert wird mit einem Playbook (z. B. updates-installieren-{{ h.group }}.yml)</span></form>{% endif %}
 </div>{% endif %}
-<div class="card"><h2 style="margin-top:0">{{ 'Bearbeiten' if name else 'Anlegen' }}</h2>
+{% if admin %}<div class="card"><h2 style="margin-top:0">{{ 'Bearbeiten' if name else 'Anlegen' }}</h2>
 <form method="post"><input type="hidden" name="csrf" value="{{csrf}}"><div class="grid">
  <div><label>Anzeigename (frei wählbar)</label><input name="display" value="{{ h.display or h.name }}" placeholder="z. B. Webserver – Büro" required></div>
  <div><label>Technischer Name für Ansible {{ '' if name else '(leer = automatisch)' }}</label><input name="name" value="{{ h.name }}" placeholder="wird aus dem Anzeigenamen gebildet" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,62}" title="nur Buchstaben, Ziffern, Punkt, Minus, Unterstrich"></div>
@@ -1833,7 +2085,7 @@ MACHINE = """{% extends "base.html" %}{% block title %}{{ (h.display or name) if
 </div><label>Notiz</label><input name="notes" value="{{ h.notes }}">
 <p><button class="acc">Speichern</button></p></form>
 {% if name %}<form method="post" onsubmit="return confirm('{{name}} wirklich löschen?')"><input type="hidden" name="csrf" value="{{csrf}}">
-<input type="hidden" name="delete" value="1"><button class="danger">Maschine löschen</button></form>{% endif %}</div>
+<input type="hidden" name="delete" value="1"><button class="danger">Maschine löschen</button></form>{% endif %}</div>{% endif %}
 {% if name and runs %}<h2>Letzte Läufe</h2><table><tr><th>Start</th><th>Lauf</th><th>Status</th></tr>
 {% for r in runs %}<tr><td class="small">{{r.start}}</td><td><a href="/laeufe/{{r.id}}">{{r.title}}</a></td>
 <td class="{{ 'st-ok' if r.status=='ok' else ('st-run' if r.status=='laeuft' else 'st-err') }}">{{r.status}}</td></tr>{% endfor %}</table>{% endif %}
@@ -1911,7 +2163,7 @@ SETTINGS = """{% extends "base.html" %}{% block title %}Einstellungen{% endblock
 <div><label>Neuer Standort</label><input name="name" placeholder="z. B. Büro"></div>
 <div><label>Netze (optional)</label><input name="nets" placeholder="z. B. 192.168.3."></div>
 <div><button class="acc">+ Standort hinzufügen</button></div></div></form></div>
-<div class="card"><h2 style="margin-top:0">Admin-Passwort ändern</h2><form method="post"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="form" value="password"><div class="grid">
+<div class="card" id="passwort"><h2 style="margin-top:0">Admin-Passwort ändern</h2><form method="post"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="form" value="password"><div class="grid">
 <div><label>Aktuelles Passwort</label><input name="old_password" type="password" autocomplete="current-password" required></div>
 <div><label>Neues Passwort (mind. 10 Zeichen)</label><input name="new_password" type="password" autocomplete="new-password" minlength="10" required></div>
 <div><label>Neues Passwort wiederholen</label><input name="new_password2" type="password" autocomplete="new-password" minlength="10" required></div>
@@ -1947,7 +2199,54 @@ if(b){document.querySelectorAll('.bb').forEach(function(e){e.style.visibility=b.
 document.getElementById('bpl').textContent=b.value=='su'?'Passwort des Zielbenutzers (für su)':'sudo-Passwort des Anmeldebenutzers';}}tg();</script>
 {% endblock %}"""
 
-app.jinja_loader = DictLoader({"base.html": BASE, "login.html": LOGIN, "index.html": INDEX, "machine.html": MACHINE,
+
+USERS = """{% extends "base.html" %}{% block title %}Benutzer{% endblock %}{% block body %}<div class="fit">
+<h1>Benutzer <span class="mut small">({{ users|length }})</span></h1>
+<p class="mut small">Der Admin <b>{{ session.user }}</b> sieht und darf alles. Benutzer sehen nur die freigegebenen Standorte bzw. Maschinen.</p>
+<table class="auto"><tr><th>Benutzer</th><th>Darf</th><th>Sieht</th><th>Geändert</th><th></th></tr>
+{% for u in users %}<tr><td><b>{{ u.name }}</b></td>
+<td>{% if u.can_run %}<span class="st-ok">ansehen + bedienen</span>{% else %}<span class="mut">nur ansehen</span>{% endif %}</td>
+<td class="small">{% for x in summary(u) %}<div>&#128205; {{ x }}</div>{% else %}<span class="st-err">nichts freigegeben</span>{% endfor %}</td>
+<td class="small mut" style="white-space:nowrap">{{ (u.changed or u.created or '')[:16] }}</td>
+<td><a class="btn" href="/benutzer/{{ u.name }}">Bearbeiten</a></td></tr>
+{% else %}<tr><td colspan="5" class="mut">Noch keine Benutzer.</td></tr>{% endfor %}</table>
+<p><a class="btn acc" href="/benutzer/neu">+ Benutzer</a></p></div>{% endblock %}"""
+
+USER = """{% extends "base.html" %}{% block title %}{{ uname or 'Neuer Benutzer' }}{% endblock %}{% block body %}<div class="fit" style="min-width:min(760px,100%)">
+<h1>{{ uname or 'Neuer Benutzer' }}</h1>
+<form method="post"><input type="hidden" name="csrf" value="{{csrf}}">
+<div class="card"><h2 style="margin-top:0">Anmeldung</h2><div class="grid">
+ <div><label>Benutzername</label><input name="name" value="{{ u.name }}" {{ 'disabled' if uname else 'required autofocus' }} pattern="[A-Za-z0-9][A-Za-z0-9._@\\-]{1,40}"></div>
+ <div><label>{{ 'Neues Passwort (leer = unverändert)' if uname else 'Passwort' }}</label><input name="password" type="password" autocomplete="new-password" minlength="10" {{ '' if uname else 'required' }}></div>
+ <div><label>Passwort wiederholen</label><input name="password2" type="password" autocomplete="new-password"></div>
+</div><div class="hint">mindestens 10 Zeichen</div>
+<label class="plain" style="display:block;margin-top:10px"><input type="checkbox" name="can_run" value="1" {{ 'checked' if u.can_run }}> darf bedienen: Ping, Info Device, Updates prüfen / installieren / planen, Neustart</label>
+<div class="hint">ohne Haken nur ansehen. Maschinen anlegen/bearbeiten, Playbooks, Einstellungen, Upgrades und Benutzer bleiben immer beim Admin.</div></div>
+<div class="card"><h2 style="margin-top:0">Was darf {{ uname or 'der Benutzer' }} sehen?</h2>
+<table class="dlg">{% for loc in locs %}{% set i = loop.index0 %}{% set v = u.perms.get(loc) %}{% set mode = 'all' if v == '*' else ('sel' if v else '') %}
+<tr><td style="width:30%"><b>&#128205; {{ loc or 'ohne Standort' }}</b><div class="mut small">{{ hs|selectattr('location', 'equalto', loc)|list|length if loc else hs|rejectattr('location')|list|length }} Maschine(n)</div></td>
+<td><select name="m{{i}}" style="width:auto" onchange="this.closest('td').querySelector('.hl').hidden = this.value != 'sel'">
+ <option value="" {{ 'selected' if not mode }}>nichts</option><option value="all" {{ 'selected' if mode == 'all' }}>alle Maschinen (auch künftige)</option><option value="sel" {{ 'selected' if mode == 'sel' }}>nur ausgewählte</option></select>
+ <div class="hl" {{ '' if mode == 'sel' else 'hidden' }} style="margin-top:6px">{% for h in hs if (h.location or '') == loc %}
+ <label class="plain" style="display:block"><input type="checkbox" name="h{{i}}" value="{{ h.name }}" {{ 'checked' if v and v != '*' and h.name in v }}> {{ h.display or h.name }} <span class="tag {{ h.group }}">{{ h.group }}</span>{% if not h.enabled %} <span class="mut small">inaktiv</span>{% endif %}</label>
+ {% else %}<span class="mut small">keine Maschinen</span>{% endfor %}</div></td></tr>
+{% else %}<tr><td class="mut">Noch keine Standorte – unter Einstellungen anlegen.</td></tr>{% endfor %}</table></div>
+<p><button class="acc">Speichern</button> <a class="btn" href="/benutzer">Zurück</a></p></form>
+{% if uname %}<form method="post" onsubmit="return confirm('Benutzer {{ uname }} wirklich löschen?')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="delete" value="1"><button class="danger">Benutzer löschen</button></form>{% endif %}
+</div>{% endblock %}"""
+
+PASSWORD = """{% extends "base.html" %}{% block title %}Passwort{% endblock %}{% block body %}
+<div class="card" style="max-width:420px;margin:30px auto"><h1>Passwort ändern</h1><form method="post"><input type="hidden" name="csrf" value="{{csrf}}">
+<label>Aktuelles Passwort</label><input name="old_password" type="password" autocomplete="current-password" required>
+<label>Neues Passwort (mind. 10 Zeichen)</label><input name="new_password" type="password" autocomplete="new-password" minlength="10" required>
+<label>Neues Passwort wiederholen</label><input name="new_password2" type="password" autocomplete="new-password" required>
+<p><button class="acc">Ändern</button></p></form></div>{% endblock %}"""
+
+FORBIDDEN = """{% extends "base.html" %}{% block title %}Keine Berechtigung{% endblock %}{% block body %}
+<div class="card" style="max-width:480px;margin:40px auto"><h1>Keine Berechtigung</h1><p class="mut">Dafür fehlen dir die Rechte. Wende dich an den Admin.</p>
+<p><a class="btn acc" href="/">Zur Maschinenliste</a></p></div>{% endblock %}"""
+
+app.jinja_loader = DictLoader({"users.html": USERS, "user.html": USER, "password.html": PASSWORD, "forbidden.html": FORBIDDEN, "base.html": BASE, "login.html": LOGIN, "index.html": INDEX, "machine.html": MACHINE,
                                "playbooks.html": PLAYBOOKS, "runs.html": RUNS, "run.html": RUN, "settings.html": SETTINGS,
                                "profile.html": PROFILE})
 

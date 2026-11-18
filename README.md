@@ -14,6 +14,9 @@ gedacht für Heimnetz und kleine Umgebungen mit Linux- und Windows-Rechnern.
   (Datum/Uhrzeit)
 - Neustart-Knöpfe für Maschinen mit „Neustart nötig“, Distributions-Upgrade (Debian/Ubuntu)
 - Playbook-Editor und Läufe mit vollständigem Log
+- Benutzer: der Admin legt Benutzer an und gibt Standorte frei – ganz oder nur ausgewählte Maschinen; pro Benutzer
+  „nur ansehen“ oder „bedienen“ (Ping, Info Device, Updates, Neustart). Maschinen, Playbooks, Einstellungen und
+  Upgrades bleiben beim Admin
 
 ## Starten
 
@@ -42,13 +45,12 @@ Das Passwort lässt sich unter *Einstellungen* ändern (wird nur als Hash gespei
 
 `hosts.json` (Maschinen), `status.json`, `facts/`, `secrets.json` (Zugangsprofile, 0600),
 `ssh/id_ed25519` (wird beim ersten Start erzeugt – öffentlicher Schlüssel unter *Einstellungen*),
-`playbooks/`, `runs/`, `schedule.json` (geplante Update-Läufe), `locations.json`, `settings.json`.
+`playbooks/`, `runs/`, `schedule.json` (geplante Update-Läufe), `users.json` (Benutzer, Passwörter nur als Hash, 0600), `locations.json`, `settings.json`.
 
 Den öffentlichen SSH-Schlüssel musst du selbst auf den Zielmaschinen hinterlegen.
 
 ## Hinweise
 
-- Die Oberfläche hat genau einen Benutzer und ist für das interne Netz gedacht – nicht ungeschützt ins
-  Internet stellen.
+- Die Oberfläche ist für das interne Netz gedacht – nicht ungeschützt ins Internet stellen.
 - Läuft die Ansible-UI selbst auf einem der verwalteten Docker-Hosts, diesen mit „Nicht bei Update alle“
   markieren: ein Docker-Update startet sonst den Container neu und bricht laufende Läufe ab.
