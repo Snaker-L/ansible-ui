@@ -837,43 +837,69 @@ def upgrade_job(rid, name, debian_new):
     updates_job(new_run("updates", name, f"Updates prüfen nach Upgrade: {name}"), [name])
 
 
-def reboot_job(rid, names, wait_min=0):
-    """Maschinen in der angegebenen Reihenfolge neu starten. Die naechste kommt erst dran, wenn die vorige
-    vollstaendig wieder laeuft (Playbook ohne ignore_errors); scheitert eine, werden die restlichen NICHT neu gestartet."""
+RECAP_RE = re.compile(r"^(\S+)\s*:\s*ok=(\d+)\s+changed=\d+\s+unreachable=(\d+)\s+failed=(\d+)", re.M)
+
+
+def reboot_job(rid, stages, wait_min=0):
+    """Neustart in Stufen: alle Maschinen einer Stufe gleichzeitig (Linux und Windows parallel), die naechste Stufe erst,
+    wenn ALLE der vorigen vollstaendig wieder laufen (Playbook ohne ignore_errors). Scheitert eine, bricht die Kette ab."""
+    if stages and isinstance(stages[0], str):  # alte Aufrufe: flache Liste = eine Maschine je Stufe
+        stages = [[n] for n in stages]
     inv = write_inventory()
     fd, pb = tempfile.mkstemp(prefix="reboot-", suffix=".yml")
     with os.fdopen(fd, "w") as f:
         f.write(REBOOT_PB)
-    done, failed = [], None
-    disp = {h["name"]: display_name(h) for h in hosts()}
+    hmap = {h["name"]: h for h in hosts()}
+    disp = {n: display_name(h) for n, h in hmap.items()}
+    dn = lambda xs: ", ".join(disp.get(x, x) for x in xs)  # noqa: E731
+    done, failed = [], []
     try:
         with open(p("runs", rid + ".log"), "w") as log:
-            log.write("Neustart nacheinander: " + " → ".join(disp.get(n, n) for n in names)
-                      + (f"\nZusätzliche Wartezeit zwischen den Maschinen: {wait_min} min" if wait_min else "") + "\n")
+            log.write("Neustart in Stufen: " + " → ".join(f"[{dn(st)}]" for st in stages)
+                      + (f"\nZusätzliche Wartezeit zwischen den Stufen: {wait_min} min" if wait_min else "") + "\n")
             log.flush()
-            for i, n in enumerate(names, 1):
-                log.write(f"\n===== [{i}/{len(names)}] {disp.get(n, n)} – {now()} =====\n\n")
+            for i, stage in enumerate(stages, 1):
+                log.write(f"\n===== Stufe {i}/{len(stages)}: {dn(stage)} – {now()} =====\n")
                 log.flush()
-                start_pos = log.tell()
-                r = subprocess.run(["ansible-playbook", "-i", inv, pb, "--limit", n],
-                                   stdout=log, stderr=subprocess.STDOUT, text=True, timeout=5400)
-                log.flush()
-                with open(p("runs", rid + ".log")) as f:
-                    f.seek(start_pos)
-                    part = f.read()
-                if r.returncode != 0 or "FAILED!" in part or "UNREACHABLE!" in part or "ok=0" in part.split("PLAY RECAP")[-1]:
-                    failed = n
-                    rest = names[i:]
-                    log.write(f"\n✗ {disp.get(n, n)} ist nicht vollständig zurückgekommen – Kette abgebrochen."
-                              + (f"\n  NICHT neu gestartet: {', '.join(disp.get(x, x) for x in rest)}" if rest else "") + "\n")
+                parts = {}
+
+                def one(group, names):
+                    fd2, tmp = tempfile.mkstemp(prefix="rb-", suffix=".log")
+                    with os.fdopen(fd2, "w") as out:
+                        r = subprocess.run(["ansible-playbook", "-i", inv, pb, "--limit", ",".join(names), "--forks", "20"],
+                                           stdout=out, stderr=subprocess.STDOUT, text=True, timeout=5400)
+                    with open(tmp) as f:
+                        parts[group] = (r.returncode, f.read())
+                    os.unlink(tmp)
+                by_group = {}
+                for n in stage:
+                    by_group.setdefault(hmap.get(n, {}).get("group", "linux"), []).append(n)
+                ths = [threading.Thread(target=one, args=(g, ns)) for g, ns in by_group.items()]
+                for t in ths:
+                    t.start()
+                for t in ths:
+                    t.join()
+                good = set()
+                for g, (rc, text) in parts.items():
+                    log.write(f"\n--- {g}: {dn(by_group[g])} ---\n{text}")
+                    for m in RECAP_RE.finditer(text):
+                        if int(m[2]) > 0 and m[3] == "0" and m[4] == "0":
+                            good.add(m[1])
+                bad = [n for n in stage if n not in good]
+                done += [n for n in stage if n in good]
+                if bad:
+                    failed = bad
+                    rest = [n for st in stages[i:] for n in st]
+                    log.write(f"\n✗ Nicht vollständig zurückgekommen: {dn(bad)} – Kette abgebrochen."
+                              + (f"\n  NICHT neu gestartet: {dn(rest)}" if rest else "") + "\n")
                     break
-                done.append(n)
-                log.write(f"\n✓ {disp.get(n, n)} läuft wieder vollständig ({now()}).\n")
-                if wait_min and i < len(names):
+                log.write(f"\n✓ Stufe {i} läuft wieder vollständig: {dn(stage)} ({now()}).\n")
+                if wait_min and i < len(stages):
                     log.write(f"  warte noch {wait_min} min …\n")
                     log.flush()
                     time.sleep(wait_min * 60)
-            log.write("\nFertig: " + (f"{len(done)} von {len(names)} neu gestartet." if failed else f"alle {len(names)} neu gestartet.") + "\n")
+            total = sum(len(st) for st in stages)
+            log.write("\nFertig: " + (f"{len(done)} von {total} neu gestartet." if failed else f"alle {total} neu gestartet.") + "\n")
         finish_run(rid, "Fehler" if failed else "ok")
     except Exception as ex:  # noqa: BLE001
         with open(p("runs", rid + ".log"), "a") as log:
@@ -882,7 +908,7 @@ def reboot_job(rid, names, wait_min=0):
     finally:
         os.unlink(inv)
         os.unlink(pb)
-    again = done + ([failed] if failed else [])
+    again = done + failed
     if again:
         adhoc_job(new_run("facts", ",".join(again), "Info Device nach Neustart: " + ", ".join(again), again), "facts", again)
         updates_job(new_run("updates", ",".join(again), "Updates prüfen nach Neustart: " + ", ".join(again), again), again)
@@ -1373,10 +1399,16 @@ def reboot_action():
     act = {h["name"]: h for h in visible_hosts() if h.get("enabled", True) and h.get("address")}
     if target:
         names = [target] if target in act else []
+        stages = [names]
         wait_min = 0
     else:
-        names = [n for n in request.form.getlist("host") if n in act]
-        names = list(dict.fromkeys(names))  # Reihenfolge behalten, doppelte raus
+        names = list(dict.fromkeys(n for n in request.form.getlist("host") if n in act))
+        def stage_of(n):
+            try:
+                return max(1, int(request.form.get("st_" + n) or 0))
+            except ValueError:
+                return 999
+        stages = [[n for n in names if stage_of(n) == k] for k in sorted({stage_of(n) for n in names})]
         try:
             wait_min = max(0, min(120, int(request.form.get("wait") or 0)))
         except ValueError:
@@ -1396,21 +1428,24 @@ def reboot_action():
         with LOCK:
             plans = load("schedule.json", [])
             plans.append({"id": uuid.uuid4().hex[:8], "kind": "reboot", "when": when.strftime("%Y-%m-%d %H:%M"),
-                          "names": names, "wait": wait_min, "created": now(), "status": "geplant"})
+                          "names": [n for st in stages for n in st], "stages": stages, "wait": wait_min, "created": now(), "status": "geplant"})
             save("schedule.json", plans)
         flash(f"Neustart von {len(names)} Maschine(n) geplant für {when.strftime('%d.%m.%Y %H:%M')}.", "ok")
         return redirect(request.referrer or "/")
-    start_reboot(names, wait_min)
+    start_reboot(stages, wait_min)
     flash(("Neustart gestartet: " + display_name(act[names[0]])) if len(names) == 1 else
-          f"Neustart von {len(names)} Maschine(n) gestartet – streng nacheinander, die nächste erst wenn die vorige vollständig läuft.", "ok")
+          f"Neustart von {len(names)} Maschine(n) in {len(stages)} Stufe(n) gestartet – die nächste Stufe erst, wenn die vorige vollständig läuft.", "ok")
     return redirect(request.referrer or "/")
 
 
-def start_reboot(names, wait_min=0):
+def start_reboot(stages, wait_min=0):
+    if stages and isinstance(stages[0], str):
+        stages = [[n] for n in stages]
     disp = {h["name"]: display_name(h) for h in hosts()}
-    title = "Neustart: " + (disp.get(names[0], names[0]) if len(names) == 1 else " → ".join(disp.get(n, n) for n in names))
+    names = [n for st in stages for n in st]
+    title = "Neustart: " + " → ".join(" + ".join(disp.get(n, n) for n in st) for st in stages)
     rid = new_run("reboot", ",".join(names), title[:200], names)
-    start(reboot_job, rid, names, wait_min)
+    start(reboot_job, rid, stages, wait_min)
     return rid
 
 
@@ -1521,9 +1556,10 @@ def schedule_loop():
             for x in due:
                 act = {h["name"] for h in hosts() if h.get("enabled", True) and h.get("address")}
                 if x.get("kind") == "reboot":
-                    names = [n for n in x["names"] if n in act]
-                    if names:
-                        start_reboot(names, int(x.get("wait") or 0))
+                    stages = [[n for n in st if n in act] for st in (x.get("stages") or [[n] for n in x["names"]])]
+                    stages = [st for st in stages if st]
+                    if stages:
+                        start_reboot(stages, int(x.get("wait") or 0))
                     continue
                 sel = [h for h in hosts() if h["name"] in act and h["name"] in set(x["names"])]
                 launch_mass("update", sel, "geplant " + x["when"][8:10] + "." + x["when"][5:7] + ". " + x["when"][11:])
@@ -2546,37 +2582,42 @@ INDEX = """{% extends "base.html" %}{% block title %}Maschinen{% endblock %}
  {% if admin %}<a class="btn acc" href="/maschine/neu{{ ('?standort=' ~ loc) if loc }}">+ Maschine</a>{% endif %}
 </div>
 {% for pl in plans %}<div class="flash plan">{% if can.plan %}<form class="inl" method="post" action="/geplant/loeschen" style="float:right;margin-left:12px"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="id" value="{{ pl.id }}"><button class="small" onclick="return confirm('Geplanten Lauf {{ pl.when }} entfernen?')">{{ 'Löschen' if pl.status == 'geplant' else 'Ausblenden' }}</button></form>{% endif %}
- &#128339; {% if pl.status == 'geplant' %}Geplant{% elif pl.status == 'gestartet' %}Gestartet{% else %}<span class="st-err">Verpasst</span>{% endif %}: {{ 'Neustart' if pl.kind == 'reboot' else 'Update' }} am <b>{{ pl.when[8:10] }}.{{ pl.when[5:7] }}.{{ pl.when[:4] }} um {{ pl.when[11:] }}</b> – {{ pl.names|length }} Maschine(n){% if pl.kind == 'reboot' %} nacheinander{% if pl.wait %}, je {{ pl.wait }} min Pause{% endif %}{% endif %}
- <div class="small mut">{% for n in pl.names %}{{ disp.get(n, n) }}{% if not loop.last %}{{ ' → ' if pl.kind == 'reboot' else ', ' }}{% endif %}{% endfor %}{% if pl.status == 'verpasst' %} · nicht ausgeführt, Container war zum Zeitpunkt nicht aktiv{% endif %}</div></div>{% endfor %}
+ &#128339; {% if pl.status == 'geplant' %}Geplant{% elif pl.status == 'gestartet' %}Gestartet{% else %}<span class="st-err">Verpasst</span>{% endif %}: {{ 'Neustart' if pl.kind == 'reboot' else 'Update' }} am <b>{{ pl.when[8:10] }}.{{ pl.when[5:7] }}.{{ pl.when[:4] }} um {{ pl.when[11:] }}</b> – {{ pl.names|length }} Maschine(n){% if pl.kind == 'reboot' %}{% if pl.stages %} in {{ pl.stages|length }} Stufe(n){% else %} nacheinander{% endif %}{% if pl.wait %}, je {{ pl.wait }} min Pause{% endif %}{% endif %}
+ <div class="small mut">{% if pl.kind == 'reboot' and pl.stages %}{% for st in pl.stages %}{% for n in st %}{{ disp.get(n, n) }}{% if not loop.last %} + {% endif %}{% endfor %}{% if not loop.last %} → {% endif %}{% endfor %}{% else %}{% for n in pl.names %}{{ disp.get(n, n) }}{% if not loop.last %}{{ ' → ' if pl.kind == 'reboot' else ', ' }}{% endif %}{% endfor %}{% endif %}{% if pl.status == 'verpasst' %} · nicht ausgeführt, Container war zum Zeitpunkt nicht aktiv{% endif %}</div></div>{% endfor %}
 <dialog id="dlg-rb"><form method="post" action="/neustart" onsubmit="return rbSubmit(this)"><input type="hidden" name="csrf" value="{{csrf}}">
-<h2 style="margin:0 0 4px;color:var(--text)">Neustart – Reihenfolge</h2>
-<div class="small mut" style="margin-bottom:8px">Streng nacheinander: die nächste Maschine startet erst neu, wenn die vorige <b>vollständig</b> wieder läuft
+<h2 style="margin:0 0 4px;color:var(--text)">Neustart – Reihenfolge in Stufen</h2>
+<div class="small mut" style="margin-bottom:8px">Die Zahl ist die <b>Stufe</b>: gleiche Zahl = gleichzeitig. Die nächste Stufe startet erst, wenn <b>alle</b> Maschinen der vorigen vollständig wieder laufen
 (Linux: <code>systemctl is-system-running</code> = running, Windows: keine Dienste mehr im Start). Kommt eine nicht zurück, bricht die Kette ab.</div>
 <div style="max-height:46vh;overflow:auto;border:1px solid var(--line);border-radius:8px"><table class="dlg" id="rb-list">
 {% for r in reboot_rows %}<tr data-n="{{ r.name }}"><td style="width:1%"><input type="checkbox" class="rbh" name="host" value="{{ r.name }}" id="rb-{{ loop.index }}" {{ '' if r.no_mass else 'checked' }} onchange="rbUpd()"></td>
-<td style="width:1%"><input type="number" class="rbnum" min="1" style="width:58px;padding:4px 6px" title="Position in der Reihenfolge" onchange="rbSort(this)"></td>
+<td style="width:1%"><input type="number" class="rbnum" name="st_{{ r.name }}" min="1" style="width:58px;padding:4px 6px" title="Stufe – gleiche Zahl = gleichzeitig" onchange="rbSort()"></td>
 <td><label for="rb-{{ loop.index }}" class="plain"><b>{{ r.display or r.name }}</b>{% if r.no_mass %} <span class="st-warn small">nur einzeln</span>{% endif %}</label>{% if r.location %}<div class="mut small">&#128205; {{ r.location }}</div>{% endif %}</td>
 <td><span class="tag {{ r.group }}">{{ r.group }}</span></td>
-<td style="white-space:nowrap;width:1%"><button type="button" class="small" title="früher" onclick="rbMove(this,-1)">&#9650;</button> <button type="button" class="small" title="später" onclick="rbMove(this,1)">&#9660;</button></td></tr>{% endfor %}
-</table></div>
-<div class="when"><label class="plain">danach jeweils noch <input type="number" name="wait" value="0" min="0" max="120" style="width:70px"> min warten</label></div>
+<td style="white-space:nowrap;width:1%"><button type="button" class="small" title="eine Stufe früher" onclick="rbMove(this,-1)">&#9650;</button> <button type="button" class="small" title="eine Stufe später" onclick="rbMove(this,1)">&#9660;</button></td></tr>{% endfor %}
+</table></div><div class="small" id="rb-sum" style="margin-top:8px"></div>
+<div class="when"><label class="plain">zwischen den Stufen noch <input type="number" name="wait" value="0" min="0" max="120" style="width:70px"> min warten</label></div>
 <div class="when"><label class="plain"><input type="radio" name="mode" value="jetzt" checked onchange="rbUpd()"> sofort starten</label>
 {% if can.plan %}<label class="plain"><input type="radio" name="mode" value="plan" id="rb-plan" onchange="rbUpd()"> geplant am</label>{% else %}<input type="radio" id="rb-plan" hidden disabled>{% endif %}
 <input type="datetime-local" name="when" id="rb-when" {{ '' if can.plan else 'hidden' }} min="{{ now_min }}" style="width:auto" onfocus="document.getElementById('rb-plan').checked=true;rbUpd()" onchange="document.getElementById('rb-plan').checked=true;rbUpd()"></div>
 <p style="text-align:right;margin:12px 0 0"><button type="button" onclick="this.closest('dialog').close()">Abbrechen</button> <button class="danger" id="rb-go">Neu starten</button></p>
 </form></dialog>
 <script>
-function rbMove(b,d){var tr=b.closest('tr'),o=d<0?tr.previousElementSibling:tr.nextElementSibling;if(!o)return;
- if(d<0)tr.parentNode.insertBefore(tr,o);else tr.parentNode.insertBefore(o,tr);rbUpd()}
-function rbSort(inp){var tb=document.getElementById('rb-list').tBodies[0]||document.getElementById('rb-list'),tr=inp.closest('tr'),c=tr.querySelector('.rbh'),
- v=parseInt(inp.value,10);if(!c.checked){c.checked=true}var rows=[].filter.call(tb.querySelectorAll('tr'),function(r){return r!==tr&&r.querySelector('.rbh').checked});
- v=Math.max(1,Math.min(isNaN(v)?rows.length+1:v,rows.length+1));var ref=rows[v-1]||null;if(ref)tb.insertBefore(tr,ref);else{var last=rows[rows.length-1];if(last)tb.insertBefore(tr,last.nextElementSibling);else tb.insertBefore(tr,tb.firstElementChild)}rbUpd()}
-function rbUpd(){var k=0;document.querySelectorAll('#rb-list tr').forEach(function(tr){var c=tr.querySelector('.rbh'),n=tr.querySelector('.rbnum');n.value=c.checked?(++k):'';n.disabled=!c.checked;tr.style.opacity=c.checked?1:.55});
- var pl=document.getElementById('rb-plan').checked,b=document.getElementById('rb-go');b.textContent=(pl?'Planen':'Jetzt neu starten')+' ('+k+')';b.disabled=!k}
-function rbSubmit(f){var names=[].map.call(f.querySelectorAll('.rbh:checked'),function(c){return c.closest('tr').querySelector('b').textContent});if(!names.length)return false;
+function rbRows(){return [].slice.call(document.querySelectorAll('#rb-list tr'))}
+function rbMove(b,d){var n=b.closest('tr').querySelector('.rbnum'),c=b.closest('tr').querySelector('.rbh');if(!c.checked)return;n.value=Math.max(1,(parseInt(n.value,10)||1)+d);rbSort()}
+function rbSort(){var rows=rbRows(),tb=rows.length?rows[0].parentNode:null;if(!tb)return;
+ rows.sort(function(a,b){var ca=a.querySelector('.rbh').checked,cb=b.querySelector('.rbh').checked;if(ca!==cb)return ca?-1:1;
+  return (parseInt(a.querySelector('.rbnum').value,10)||999)-(parseInt(b.querySelector('.rbnum').value,10)||999)});
+ rows.forEach(function(r){tb.appendChild(r)});rbUpd()}
+function rbStages(){var st={};rbRows().forEach(function(tr){var c=tr.querySelector('.rbh');if(!c.checked)return;var k=parseInt(tr.querySelector('.rbnum').value,10)||1;
+ (st[k]=st[k]||[]).push(tr.querySelector('b').textContent)});return Object.keys(st).map(Number).sort(function(a,b){return a-b}).map(function(k){return st[k]})}
+function rbUpd(){var mx=0;rbRows().forEach(function(tr){var c=tr.querySelector('.rbh'),n=tr.querySelector('.rbnum');if(c.checked&&n.value)mx=Math.max(mx,parseInt(n.value,10)||0)});
+ var k=0;rbRows().forEach(function(tr){var c=tr.querySelector('.rbh'),n=tr.querySelector('.rbnum');if(c.checked){k++;if(!n.value)n.value=++mx}else n.value='';n.disabled=!c.checked;tr.style.opacity=c.checked?1:.55});
+ var sts=rbStages();document.getElementById('rb-sum').innerHTML=sts.length?sts.map(function(s,i){return '<b>Stufe '+(i+1)+':</b> '+s.join(', ')}).join(' &nbsp;→&nbsp; '):'';
+var pl=document.getElementById('rb-plan').checked,b=document.getElementById('rb-go');b.textContent=(pl?'Planen':'Jetzt neu starten')+' ('+k+(sts.length>1?' in '+sts.length+' Stufen':'')+')';b.disabled=!k}
+function rbSubmit(f){var sts=rbStages();if(!sts.length)return false;
  if(document.getElementById('rb-plan').checked){var w=document.getElementById('rb-when').value;if(!w){alert('Bitte Datum und Uhrzeit angeben.');return false}
   if(new Date(w)<=new Date()){alert('Der Zeitpunkt liegt in der Vergangenheit.');return false}return true}
- return confirm('Jetzt nacheinander neu starten?\\n\\n'+names.map(function(n,i){return (i+1)+'. '+n}).join('\\n'))}
+ return confirm('Jetzt in Stufen neu starten?\\n\\n'+sts.map(function(s,i){return 'Stufe '+(i+1)+': '+s.join(', ')}).join('\\n'))}
 </script>
 <dialog id="dlg-upd"><form method="post" action="/massen" onsubmit="return updSubmit(this)"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="update"><input type="hidden" name="pick" value="1">
 <h2 style="margin:0 0 4px;color:var(--text)">Updates installieren</h2>

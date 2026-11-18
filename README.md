@@ -12,8 +12,8 @@ gedacht für Heimnetz und kleine Umgebungen mit Linux- und Windows-Rechnern.
 - Update-Prüfung (apt, dnf/yum, zypper, Windows Update), optional jede Nacht automatisch
 - Updates installieren: einzeln, für alle bzw. eine Auswahl – im Dialog abwählbar, sofort oder **geplant**
   (Datum/Uhrzeit)
-- Neustart: einzeln oder im Dialog mit selbst festgelegter Reihenfolge – streng nacheinander, die nächste erst, wenn die
-  vorige vollständig läuft (sonst Abbruch); optional Pause dazwischen, sofort oder geplant
+- Neustart: einzeln oder im Dialog in Stufen – gleiche Nummer = gleichzeitig, die nächste Stufe erst, wenn alle der
+  vorigen vollständig laufen (sonst Abbruch); optional Pause zwischen den Stufen, sofort oder geplant
 - Distributions-Upgrade (Debian/Ubuntu)
 - Playbook-Editor und Läufe mit vollständigem Log
 - Benutzer und Benutzergruppen: der Admin gibt Standorte frei – ganz oder nur ausgewählte Maschinen – und legt die
