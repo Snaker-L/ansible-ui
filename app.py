@@ -2884,7 +2884,7 @@ USERS = """{% extends "base.html" %}{% block title %}Benutzer{% endblock %}{% bl
 {% for u in users %}<tr><td><b>{{ u.display or u.name }}</b>{% if u.display %}<div class="mut small">{{ u.name }}</div>{% endif %}{% if u.email %}<div class="mut small">{{ u.email }}</div>{% endif %}</td>
 <td class="small">{% if u.source == 'ad' %}<span class="tag windows">AD</span>{% else %}<span class="tag">lokal</span>{% endif %}
  {% if u.invite and u.invite.expires > now_ts %}<div class="st-warn">Einladung offen</div>{% elif u.source != 'ad' and not u.hash %}<div class="st-err">kein Passwort</div>{% elif u.must_change %}<div class="st-warn">muss Passwort ändern</div>{% endif %}</td>
-<td class="small">{% set ea = eff_actions(u) %}{% if ea %}<span class="st-ok">{{ ea|map('extract', actions)|join(', ') }}</span>{% else %}<span class="mut">nur ansehen</span>{% endif %}
+<td class="small">{% set ea = eff_actions(u) %}{% if ea %}<span class="st-ok">{{ actions.keys()|select('in', ea)|map('extract', actions)|join(', ') }}</span>{% else %}<span class="mut">nur ansehen</span>{% endif %}
  {% if u.groups %}<div class="mut">Gruppen: {{ u.groups|map('extract', gname)|join(', ') }}</div>{% endif %}</td>
 <td class="small">{% for x in summary(u) %}<div>&#128205; {{ x }}</div>{% else %}{% if u.groups %}<span class="mut">über Gruppen</span>{% else %}<span class="st-err">nichts freigegeben</span>{% endif %}{% endfor %}</td>
 <td class="small mut" style="white-space:nowrap">{{ (u.changed or u.created or '')|de_date }}</td>
@@ -2912,7 +2912,7 @@ USER = """{% extends "base.html" %}{% block title %}{{ uname or 'Neuer Benutzer'
 <label class="plain" style="display:block"><input type="checkbox" name="grp" value="{{ g.id }}" {{ 'checked' if g.id in (u.groups or []) }}> <b>{{ g.name }}</b> <span class="mut small">{{ g.actions|map('extract', actions)|join(', ') or 'nur ansehen' }}</span></label>
 {% else %}<span class="mut small">Noch keine Gruppen – <a href="/benutzer/gruppen">Benutzergruppe anlegen</a>.</span>{% endfor %}</div>
 <div class="card"><h2 style="margin-top:0">Was darf {{ uname or 'der Benutzer' }}?</h2>{% set acts = own_actions(u) %}{% set inherited = eff_actions(u) %}{% include "acts.html" %}</div>
-{% set pobj = u.perms %}{% set ptitle = 'Was darf ' ~ (uname or 'der Benutzer') ~ ' selbst sehen?' %}{% set phint = 'zusätzlich zu dem, was seine Gruppen freigeben' if all_groups else '' %}{% include "perms.html" %}
+{% set pobj = u.perms %}{% set ptitle = 'Was darf ' ~ (uname or 'der Benutzer') ~ ' selbst sehen?' %}{% set phint = 'zusätzlich zu dem, was die Gruppen freigeben' if all_groups else '' %}{% include "perms.html" %}
 <p><button class="acc">Speichern</button> <a class="btn" href="/benutzer">Zurück</a></p></form>
 {% if uname %}<div class="card"><h2 style="margin-top:0">{{ 'Zugang' if u.source == 'ad' else 'Passwort zurücksetzen / einladen' }}</h2><div class="bar" style="margin:0">
 {% if u.source != 'ad' %}<form class="inl" method="post" onsubmit="return confirm('Neues Zufallspasswort für {{ uname }} erzeugen? Das alte gilt dann nicht mehr.')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="act" value="resetpw"><button>&#127922; Zufallspasswort setzen</button></form>{% endif %}
@@ -3008,7 +3008,7 @@ ACTS = """<div class="grid top" style="grid-template-columns:repeat(auto-fill,mi
 
 GROUPS_T = """{% extends "base.html" %}{% block title %}Benutzergruppen{% endblock %}{% block body %}<div class="fit">
 <h1>Benutzergruppen <span class="mut small">({{ grps|length }})</span></h1>
-<p class="mut small">Eine Gruppe bündelt Rechte und sichtbare Standorte/Maschinen. Ein Benutzer darf alles, was seine Gruppen und seine eigenen Einstellungen zusammen erlauben.</p>
+<p class="mut small">Eine Gruppe bündelt Rechte und sichtbare Standorte/Maschinen. Ein Benutzer darf alles, was die eigenen Gruppen und die eigenen Einstellungen zusammen erlauben.</p>
 <table class="auto"><tr><th>Gruppe</th><th>Darf</th><th>Sieht</th><th>Mitglieder</th><th></th></tr>
 {% for g in grps %}<tr><td><b>{{ g.name }}</b></td><td class="small">{{ g.actions|map('extract', actions)|join(', ') or 'nur ansehen' }}</td>
 <td class="small">{% for x in summary(g) %}<div>&#128205; {{ x }}</div>{% else %}<span class="mut">nichts</span>{% endfor %}</td>

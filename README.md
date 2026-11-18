@@ -18,12 +18,39 @@ gedacht für Heimnetz und kleine Umgebungen mit Linux- und Windows-Rechnern.
 - Playbook-Editor und Läufe mit vollständigem Log
 - Benutzer und Benutzergruppen: der Admin gibt Standorte frei – ganz oder nur ausgewählte Maschinen – und legt die
   Rechte einzeln fest (Ping, Info Device, Updates prüfen und Update Check, Updates installieren, Planen, Neustart); ein Benutzer darf
-  alles, was seine Gruppen und seine eigenen Einstellungen zusammen erlauben. Maschinen, Playbooks, Einstellungen und
+  alles, was die eigenen Gruppen und Einstellungen zusammen erlauben. Maschinen, Playbooks, Einstellungen und
   Upgrades bleiben beim Admin. Rechte pro Standort auch als „alle Linux“ / „alle Windows“
 - Benutzer per E-Mail einladen (Link zum Passwort-Festlegen, 72 h), Passwort erzeugen oder zurücksetzen
   (Benutzer muss es beim nächsten Login ändern)
 - Active Directory: AD-Benutzer suchen und übernehmen, Anmeldung mit dem Domänen-Passwort (LDAPS oder StartTLS,
   mehrere DCs, optionaler Gruppenfilter)
+
+## Screenshots
+
+*Alle Bilder mit erfundenen Demo-Daten.*
+
+**Maschinenliste** – Standorte, Filter, Update-Status, Update-Aktionen und geplante Läufe
+
+![Maschinenliste](docs/screenshots/startseite.png)
+
+<table><tr>
+<td width="50%"><b>Updates installieren</b> – Maschinen abwählen, sofort oder geplant<br><img src="docs/screenshots/update-dialog.png" alt="Update-Dialog"></td>
+<td width="50%"><b>Neustart in Stufen</b> – gleiche Nummer = gleichzeitig, die nächste Stufe erst, wenn alle vorigen wieder laufen<br><img src="docs/screenshots/neustart-dialog.png" alt="Neustart-Dialog"></td>
+</tr></table>
+
+**Detailseite einer Maschine** – System, Updates mit Paketliste, Playbook ausführen
+
+![Detailseite](docs/screenshots/maschine.png)
+
+**Benutzer** – lokal oder aus dem Active Directory, Rechte einzeln oder über Gruppen
+
+![Benutzer](docs/screenshots/benutzer.png)
+
+![Benutzer bearbeiten](docs/screenshots/benutzer-bearbeiten.png)
+
+**Benutzergruppen**
+
+![Benutzergruppen](docs/screenshots/gruppen.png)
 
 ## Starten
 
