@@ -2520,7 +2520,7 @@ SETTINGS = """{% extends "base.html" %}{% block title %}Einstellungen{% endblock
 <div><label><input type="checkbox" name="upd_nightly" value="1" style="width:auto" {{ 'checked' if conf.upd_nightly }}> jede Nacht automatisch prüfen</label></div>
 <div><label>Uhrzeit</label><input name="upd_time" type="time" value="{{ conf.upd_time }}"></div>
 <div><button>Speichern</button></div></div></form>
-<p class="mut small">{{ ('Zuletzt automatisch geprüft: ' ~ conf.upd_last) if conf.upd_last else 'Noch keine automatische Prüfung.' }}</p></div>
+<p class="mut small">{{ ('Zuletzt automatisch geprüft: ' ~ (conf.upd_last|de_date)) if conf.upd_last else 'Noch keine automatische Prüfung.' }}</p></div>
 <div class="card" id="standorte"><h2 style="margin-top:0">Standorte</h2>
 <p class="mut small">Reihenfolge = Reihenfolge in der Maschinenliste. Über die Netze (Anfang der IP-Adresse, z. B. <code>192.168.2.</code>) werden neue Maschinen automatisch zugeordnet.</p>
 <table><tr><th style="width:70px">Pos.</th><th>Name</th><th>Netze (mit Komma getrennt)</th><th>Maschinen</th><th></th></tr>
@@ -2694,6 +2694,13 @@ FORBIDDEN = """{% extends "base.html" %}{% block title %}Keine Berechtigung{% en
 <div class="card" style="max-width:480px;margin:40px auto"><h1>Keine Berechtigung</h1><p class="mut">Dafür fehlen dir die Rechte. Wende dich an den Admin.</p>
 <p><a class="btn acc" href="/">Zur Maschinenliste</a></p></div>{% endblock %}"""
 
+def de_date(v):
+    """ISO-Datum/Zeitstempel ("2026-11-18" / "2026-11-18 04:00:12") -> deutsch "18.11.2026" / "18.11.2026 04:00"."""
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}:\d{2}))?", str(v or ""))
+    return f"{m[3]}.{m[2]}.{m[1]}" + (f" {m[4]}" if m[4] else "") if m else (v or "")
+
+
+app.jinja_env.filters["de_date"] = de_date
 app.jinja_loader = DictLoader({"directory.html": DIRECTORY, "ad_add.html": AD_ADD, "invite.html": INVITE, "users.html": USERS, "user.html": USER, "password.html": PASSWORD, "forbidden.html": FORBIDDEN, "base.html": BASE, "login.html": LOGIN, "index.html": INDEX, "machine.html": MACHINE,
                                "playbooks.html": PLAYBOOKS, "runs.html": RUNS, "run.html": RUN, "settings.html": SETTINGS,
                                "profile.html": PROFILE})
