@@ -641,29 +641,61 @@ def updates_job(rid, names):
 
 
 REBOOT_PB = r"""
+# Eine Maschine neu starten und warten, bis sie VOLLSTAENDIG wieder laeuft (sonst Fehler -> Kette bricht ab).
 - name: Linux neu starten
   hosts: linux
   gather_facts: false
-  serial: 1
   tasks:
     - name: Neustart (Linux)
       become: "{{ ansible_become_method is defined }}"
-      ignore_errors: true
-      ignore_unreachable: true
       ansible.builtin.reboot:
         reboot_timeout: 900
         msg: "Neustart durch Ansible-UI"
+    - name: Warten, bis das System vollstaendig gestartet ist (systemctl is-system-running)
+      ansible.builtin.command: systemctl is-system-running
+      register: sysstate
+      changed_when: false
+      failed_when: false
+      until: sysstate.stdout in ['running', 'degraded'] or sysstate.rc == 127 or 'not found' in (sysstate.stderr | default(''))
+      retries: 60
+      delay: 10
+    - name: System nicht vollstaendig gestartet
+      ansible.builtin.fail:
+        msg: "Systemzustand nach 10 Minuten: {{ sysstate.stdout | default('?') }} - Kette abgebrochen."
+      when: not (sysstate.stdout in ['running', 'degraded'] or sysstate.rc == 127 or 'not found' in (sysstate.stderr | default('')))
+    - name: Ausgefallene Dienste (System laeuft, aber "degraded")
+      ansible.builtin.command: systemctl --failed --no-legend --no-pager
+      register: failedunits
+      changed_when: false
+      when: sysstate.stdout == 'degraded'
+    - name: Hinweis
+      ansible.builtin.debug:
+        msg: "ACHTUNG degraded - ausgefallene Dienste: {{ failedunits.stdout_lines | default([]) }}"
+      when: sysstate.stdout == 'degraded'
 - name: Windows neu starten
   hosts: windows
   gather_facts: false
-  serial: 1
   tasks:
     - name: Neustart (Windows)
-      ignore_errors: true
-      ignore_unreachable: true
       ansible.windows.win_reboot:
         reboot_timeout: 1800
+        post_reboot_delay: 30
         msg: "Neustart durch Ansible-UI"
+    - name: Warten, bis keine Dienste mehr starten
+      ansible.windows.win_shell: "@(Get-Service | Where-Object { $_.Status -like '*Pending' }).Count"
+      register: pend
+      changed_when: false
+      until: (pend.stdout | default('x') | trim) == '0'
+      retries: 60
+      delay: 10
+    - name: Automatische Dienste, die nicht laufen (nur Info)
+      ansible.windows.win_shell: "Get-CimInstance Win32_Service -Filter \"StartMode='Auto' AND State<>'Running'\" | Select-Object -ExpandProperty Name"
+      register: autostopped
+      changed_when: false
+      failed_when: false
+    - name: Hinweis
+      ansible.builtin.debug:
+        msg: "Automatische Dienste nicht gestartet (oft normal): {{ autostopped.stdout_lines | default([]) }}"
 """
 
 
@@ -805,23 +837,44 @@ def upgrade_job(rid, name, debian_new):
     updates_job(new_run("updates", name, f"Updates prüfen nach Upgrade: {name}"), [name])
 
 
-def reboot_job(rid, names):
-    """Maschinen nacheinander neu starten (serial: 1, Ansible wartet jeweils bis sie wieder da ist), danach Updates neu pruefen."""
+def reboot_job(rid, names, wait_min=0):
+    """Maschinen in der angegebenen Reihenfolge neu starten. Die naechste kommt erst dran, wenn die vorige
+    vollstaendig wieder laeuft (Playbook ohne ignore_errors); scheitert eine, werden die restlichen NICHT neu gestartet."""
     inv = write_inventory()
     fd, pb = tempfile.mkstemp(prefix="reboot-", suffix=".yml")
     with os.fdopen(fd, "w") as f:
         f.write(REBOOT_PB)
-    ok = False
+    done, failed = [], None
+    disp = {h["name"]: display_name(h) for h in hosts()}
     try:
         with open(p("runs", rid + ".log"), "w") as log:
-            log.write("$ Neustart nacheinander: " + ", ".join(names) + "\n\n")
+            log.write("Neustart nacheinander: " + " → ".join(disp.get(n, n) for n in names)
+                      + (f"\nZusätzliche Wartezeit zwischen den Maschinen: {wait_min} min" if wait_min else "") + "\n")
             log.flush()
-            r = subprocess.run(["ansible-playbook", "-i", inv, pb, "--limit", ",".join(names)],
-                               stdout=log, stderr=subprocess.STDOUT, text=True, timeout=14400)
-        with open(p("runs", rid + ".log")) as f:
-            text = f.read()
-        ok = r.returncode == 0 and "FAILED!" not in text and "UNREACHABLE!" not in text
-        finish_run(rid, "ok" if ok else "Fehler")
+            for i, n in enumerate(names, 1):
+                log.write(f"\n===== [{i}/{len(names)}] {disp.get(n, n)} – {now()} =====\n\n")
+                log.flush()
+                start_pos = log.tell()
+                r = subprocess.run(["ansible-playbook", "-i", inv, pb, "--limit", n],
+                                   stdout=log, stderr=subprocess.STDOUT, text=True, timeout=5400)
+                log.flush()
+                with open(p("runs", rid + ".log")) as f:
+                    f.seek(start_pos)
+                    part = f.read()
+                if r.returncode != 0 or "FAILED!" in part or "UNREACHABLE!" in part or "ok=0" in part.split("PLAY RECAP")[-1]:
+                    failed = n
+                    rest = names[i:]
+                    log.write(f"\n✗ {disp.get(n, n)} ist nicht vollständig zurückgekommen – Kette abgebrochen."
+                              + (f"\n  NICHT neu gestartet: {', '.join(disp.get(x, x) for x in rest)}" if rest else "") + "\n")
+                    break
+                done.append(n)
+                log.write(f"\n✓ {disp.get(n, n)} läuft wieder vollständig ({now()}).\n")
+                if wait_min and i < len(names):
+                    log.write(f"  warte noch {wait_min} min …\n")
+                    log.flush()
+                    time.sleep(wait_min * 60)
+            log.write("\nFertig: " + (f"{len(done)} von {len(names)} neu gestartet." if failed else f"alle {len(names)} neu gestartet.") + "\n")
+        finish_run(rid, "Fehler" if failed else "ok")
     except Exception as ex:  # noqa: BLE001
         with open(p("runs", rid + ".log"), "a") as log:
             log.write(f"\nFehler: {ex}\n")
@@ -829,8 +882,10 @@ def reboot_job(rid, names):
     finally:
         os.unlink(inv)
         os.unlink(pb)
-    adhoc_job(new_run("facts", ",".join(names), "Info Device nach Neustart: " + ", ".join(names)), "facts", names)
-    updates_job(new_run("updates", ",".join(names), "Updates prüfen nach Neustart: " + ", ".join(names)), names)
+    again = done + ([failed] if failed else [])
+    if again:
+        adhoc_job(new_run("facts", ",".join(again), "Info Device nach Neustart: " + ", ".join(again), again), "facts", again)
+        updates_job(new_run("updates", ",".join(again), "Updates prüfen nach Neustart: " + ", ".join(again), again), again)
 
 
 def settings_data():
@@ -1142,6 +1197,7 @@ def index():
                                         and (r["st"].get("upd") or {}).get("reboot")),
                            n_upd=sum(1 for r in rows if r.get("enabled", True) and r.get("address") and not r.get("no_mass")
                                      and (r["st"].get("upd") or {}).get("ok") and r["st"]["upd"].get("count")),
+                           reboot_rows=[r for r in rows if r.get("enabled", True) and r.get("address") and (r["st"].get("upd") or {}).get("reboot")],
                            upd_rows=[r for r in rows if r.get("enabled", True) and r.get("address")
                                      and (r["st"].get("upd") or {}).get("ok") and r["st"]["upd"].get("count")],
                            plans=sorted([x for x in load("schedule.json", []) if is_admin()
@@ -1262,28 +1318,51 @@ def upgrade_action():
 @app.post("/neustart")
 @run_required
 def reboot_action():
-    """Neustart einer Maschine oder aller (gefilterten) Maschinen, die einen Neustart brauchen."""
+    """Neustart einer Maschine (target) oder aus dem Dialog: angehakte Maschinen in der gewaehlten Reihenfolge,
+    sofort oder geplant."""
     target = request.form.get("target", "")
-    grp, loc, stat = request.form.get("gruppe", ""), request.form.get("standort", ""), request.form.get("status", "")
-    updf = request.form.get("updates", "")
-    st = load("status.json", {})
-    act = [h for h in visible_hosts() if h.get("enabled", True) and h.get("address")]
+    act = {h["name"]: h for h in visible_hosts() if h.get("enabled", True) and h.get("address")}
     if target:
-        sel = [h for h in act if h["name"] == target]
+        names = [target] if target in act else []
+        wait_min = 0
     else:
-        sel = [h for h in act if (st.get(h["name"], {}).get("upd") or {}).get("reboot") and not h.get("no_mass")
-               and (not grp or h["group"] == grp) and (not loc or h.get("location") == loc)
-               and (not stat or status_key(h, st.get(h["name"], {})) == stat)
-               and (not updf or updf in upd_keys(h, st.get(h["name"], {})))]
-    if not sel:
-        flash("Keine Maschine, die einen Neustart braucht.", "err")
+        names = [n for n in request.form.getlist("host") if n in act]
+        names = list(dict.fromkeys(names))  # Reihenfolge behalten, doppelte raus
+        try:
+            wait_min = max(0, min(120, int(request.form.get("wait") or 0)))
+        except ValueError:
+            wait_min = 0
+    if not names:
+        flash("Keine Maschine zum Neustarten ausgewählt.", "err")
         return redirect(request.referrer or "/")
-    names = [h["name"] for h in sel]
-    title = "Neustart: " + (display_name(sel[0]) if target else f"{len(names)} Maschine(n) nacheinander")
-    rid = new_run("reboot", ",".join(names), title, names)
-    start(reboot_job, rid, names)
-    flash(f"{title} gestartet – Ansible wartet jeweils, bis die Maschine wieder erreichbar ist.", "ok")
+    if not target and request.form.get("mode") == "plan":
+        try:
+            when = datetime.datetime.strptime(request.form.get("when", ""), "%Y-%m-%dT%H:%M")
+        except ValueError:
+            flash("Bitte Datum und Uhrzeit für den geplanten Neustart angeben.", "err")
+            return redirect(request.referrer or "/")
+        if when <= datetime.datetime.now():
+            flash("Der geplante Zeitpunkt liegt in der Vergangenheit.", "err")
+            return redirect(request.referrer or "/")
+        with LOCK:
+            plans = load("schedule.json", [])
+            plans.append({"id": uuid.uuid4().hex[:8], "kind": "reboot", "when": when.strftime("%Y-%m-%d %H:%M"),
+                          "names": names, "wait": wait_min, "created": now(), "status": "geplant"})
+            save("schedule.json", plans)
+        flash(f"Neustart von {len(names)} Maschine(n) geplant für {when.strftime('%d.%m.%Y %H:%M')}.", "ok")
+        return redirect(request.referrer or "/")
+    start_reboot(names, wait_min)
+    flash(("Neustart gestartet: " + display_name(act[names[0]])) if len(names) == 1 else
+          f"Neustart von {len(names)} Maschine(n) gestartet – streng nacheinander, die nächste erst wenn die vorige vollständig läuft.", "ok")
     return redirect(request.referrer or "/")
+
+
+def start_reboot(names, wait_min=0):
+    disp = {h["name"]: display_name(h) for h in hosts()}
+    title = "Neustart: " + (disp.get(names[0], names[0]) if len(names) == 1 else " → ".join(disp.get(n, n) for n in names))
+    rid = new_run("reboot", ",".join(names), title[:200], names)
+    start(reboot_job, rid, names, wait_min)
+    return rid
 
 
 def launch_mass(kind, sel, label):
@@ -1386,7 +1465,13 @@ def schedule_loop():
                 save("schedule.json", [x for x in plans if x["status"] == "geplant"
                                        or x.get("started", "") >= (nowdt - datetime.timedelta(days=2)).strftime("%Y-%m-%d")])
             for x in due:
-                sel = [h for h in hosts() if h.get("enabled", True) and h.get("address") and h["name"] in set(x["names"])]
+                act = {h["name"] for h in hosts() if h.get("enabled", True) and h.get("address")}
+                if x.get("kind") == "reboot":
+                    names = [n for n in x["names"] if n in act]
+                    if names:
+                        start_reboot(names, int(x.get("wait") or 0))
+                    continue
+                sel = [h for h in hosts() if h["name"] in act and h["name"] in set(x["names"])]
                 launch_mass("update", sel, "geplant " + x["when"][8:10] + "." + x["when"][5:7] + ". " + x["when"][11:])
         except Exception:  # noqa: BLE001
             pass
@@ -2332,13 +2417,39 @@ INDEX = """{% extends "base.html" %}{% block title %}Maschinen{% endblock %}
  <form class="inl" method="post" action="/massen"><input type="hidden" name="csrf" value="{{csrf}}">
   <input type="hidden" name="kind" value="check"><input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button title="Probelauf der Update-Playbooks – installiert nichts">Check {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }}</button></form>
  <button type="button" class="acc" {{ 'disabled' if not upd_rows }} title="Maschinen auswählen, sofort oder geplant" onclick="document.getElementById('dlg-upd').showModal();updCount()">Update {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }} ({{ n_upd }})</button>
- {% if n_reboot %}<form class="inl" method="post" action="/neustart" onsubmit="return confirm('{{ n_reboot }} Maschine(n) nacheinander neu starten? Jede ist dabei ein paar Minuten nicht erreichbar.')"><input type="hidden" name="csrf" value="{{csrf}}">
-  <input type="hidden" name="gruppe" value="{{grp}}"><input type="hidden" name="standort" value="{{loc}}"><input type="hidden" name="status" value="{{stat}}"><input type="hidden" name="updates" value="{{updf}}"><button class="danger" title="nur Maschinen mit „Neustart nötig“, nacheinander">Neustart {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }} ({{ n_reboot }})</button></form>{% endif %}
+ {% if reboot_rows %}<button type="button" class="danger" title="Reihenfolge festlegen – streng nacheinander" onclick="document.getElementById('dlg-rb').showModal();rbUpd()">Neustart {{ 'alle' if not (grp or loc or stat or updf) else 'Auswahl' }} ({{ n_reboot }})</button>{% endif %}
  {% endif %}{% if admin %}<a class="btn acc" href="/maschine/neu{{ ('?standort=' ~ loc) if loc }}">+ Maschine</a>{% endif %}
 </div>
-{% for pl in plans %}<div class="flash plan">{% if can_run %}<form class="inl" method="post" action="/geplant/loeschen" style="float:right;margin-left:12px"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="id" value="{{ pl.id }}"><button class="small" onclick="return confirm('Geplanten Update-Lauf {{ pl.when }} entfernen?')">{{ 'Löschen' if pl.status == 'geplant' else 'Ausblenden' }}</button></form>{% endif %}
- &#128339; {% if pl.status == 'geplant' %}Geplant{% elif pl.status == 'gestartet' %}Gestartet{% else %}<span class="st-err">Verpasst</span>{% endif %}: Update am <b>{{ pl.when[8:10] }}.{{ pl.when[5:7] }}.{{ pl.when[:4] }} um {{ pl.when[11:] }}</b> – {{ pl.names|length }} Maschine(n)
- <div class="small mut">{% for n in pl.names %}{{ disp.get(n, n) }}{% if not loop.last %}, {% endif %}{% endfor %}{% if pl.status == 'verpasst' %} · nicht ausgeführt, Container war zum Zeitpunkt nicht aktiv{% endif %}</div></div>{% endfor %}
+{% for pl in plans %}<div class="flash plan">{% if can_run %}<form class="inl" method="post" action="/geplant/loeschen" style="float:right;margin-left:12px"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="id" value="{{ pl.id }}"><button class="small" onclick="return confirm('Geplanten Lauf {{ pl.when }} entfernen?')">{{ 'Löschen' if pl.status == 'geplant' else 'Ausblenden' }}</button></form>{% endif %}
+ &#128339; {% if pl.status == 'geplant' %}Geplant{% elif pl.status == 'gestartet' %}Gestartet{% else %}<span class="st-err">Verpasst</span>{% endif %}: {{ 'Neustart' if pl.kind == 'reboot' else 'Update' }} am <b>{{ pl.when[8:10] }}.{{ pl.when[5:7] }}.{{ pl.when[:4] }} um {{ pl.when[11:] }}</b> – {{ pl.names|length }} Maschine(n){% if pl.kind == 'reboot' %} nacheinander{% if pl.wait %}, je {{ pl.wait }} min Pause{% endif %}{% endif %}
+ <div class="small mut">{% for n in pl.names %}{{ disp.get(n, n) }}{% if not loop.last %}{{ ' → ' if pl.kind == 'reboot' else ', ' }}{% endif %}{% endfor %}{% if pl.status == 'verpasst' %} · nicht ausgeführt, Container war zum Zeitpunkt nicht aktiv{% endif %}</div></div>{% endfor %}
+<dialog id="dlg-rb"><form method="post" action="/neustart" onsubmit="return rbSubmit(this)"><input type="hidden" name="csrf" value="{{csrf}}">
+<h2 style="margin:0 0 4px;color:var(--text)">Neustart – Reihenfolge</h2>
+<div class="small mut" style="margin-bottom:8px">Streng nacheinander: die nächste Maschine startet erst neu, wenn die vorige <b>vollständig</b> wieder läuft
+(Linux: <code>systemctl is-system-running</code> = running, Windows: keine Dienste mehr im Start). Kommt eine nicht zurück, bricht die Kette ab.</div>
+<div style="max-height:46vh;overflow:auto;border:1px solid var(--line);border-radius:8px"><table class="dlg" id="rb-list">
+{% for r in reboot_rows %}<tr data-n="{{ r.name }}"><td style="width:1%"><input type="checkbox" class="rbh" name="host" value="{{ r.name }}" id="rb-{{ loop.index }}" {{ '' if r.no_mass else 'checked' }} onchange="rbUpd()"></td>
+<td style="width:1%" class="rbpos st-warn"></td>
+<td><label for="rb-{{ loop.index }}" class="plain"><b>{{ r.display or r.name }}</b>{% if r.no_mass %} <span class="st-warn small">nur einzeln</span>{% endif %}</label>{% if r.location %}<div class="mut small">&#128205; {{ r.location }}</div>{% endif %}</td>
+<td><span class="tag {{ r.group }}">{{ r.group }}</span></td>
+<td style="white-space:nowrap;width:1%"><button type="button" class="small" title="früher" onclick="rbMove(this,-1)">&#9650;</button> <button type="button" class="small" title="später" onclick="rbMove(this,1)">&#9660;</button></td></tr>{% endfor %}
+</table></div>
+<div class="when"><label class="plain">danach jeweils noch <input type="number" name="wait" value="0" min="0" max="120" style="width:70px"> min warten</label></div>
+<div class="when"><label class="plain"><input type="radio" name="mode" value="jetzt" checked onchange="rbUpd()"> sofort starten</label>
+<label class="plain"><input type="radio" name="mode" value="plan" id="rb-plan" onchange="rbUpd()"> geplant am</label>
+<input type="datetime-local" name="when" id="rb-when" min="{{ now_min }}" style="width:auto" onfocus="document.getElementById('rb-plan').checked=true;rbUpd()" onchange="document.getElementById('rb-plan').checked=true;rbUpd()"></div>
+<p style="text-align:right;margin:12px 0 0"><button type="button" onclick="this.closest('dialog').close()">Abbrechen</button> <button class="danger" id="rb-go">Neu starten</button></p>
+</form></dialog>
+<script>
+function rbMove(b,d){var tr=b.closest('tr'),o=d<0?tr.previousElementSibling:tr.nextElementSibling;if(!o)return;
+ if(d<0)tr.parentNode.insertBefore(tr,o);else tr.parentNode.insertBefore(o,tr);rbUpd()}
+function rbUpd(){var k=0;document.querySelectorAll('#rb-list tr').forEach(function(tr){var c=tr.querySelector('.rbh');tr.querySelector('.rbpos').textContent=c.checked?(++k)+'.':'';tr.style.opacity=c.checked?1:.55});
+ var pl=document.getElementById('rb-plan').checked,b=document.getElementById('rb-go');b.textContent=(pl?'Planen':'Jetzt neu starten')+' ('+k+')';b.disabled=!k}
+function rbSubmit(f){var names=[].map.call(f.querySelectorAll('.rbh:checked'),function(c){return c.closest('tr').querySelector('b').textContent});if(!names.length)return false;
+ if(document.getElementById('rb-plan').checked){var w=document.getElementById('rb-when').value;if(!w){alert('Bitte Datum und Uhrzeit angeben.');return false}
+  if(new Date(w)<=new Date()){alert('Der Zeitpunkt liegt in der Vergangenheit.');return false}return true}
+ return confirm('Jetzt nacheinander neu starten?\n\n'+names.map(function(n,i){return (i+1)+'. '+n}).join('\n'))}
+</script>
 <dialog id="dlg-upd"><form method="post" action="/massen" onsubmit="return updSubmit(this)"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="kind" value="update"><input type="hidden" name="pick" value="1">
 <h2 style="margin:0 0 4px;color:var(--text)">Updates installieren</h2>
 <div class="small mut" style="margin-bottom:8px">Maschinen mit offenen Updates{{ ' (aktueller Filter)' if (grp or loc or stat or updf) }} · ohne Neustart · <a href="#" onclick="updAll(true);return false">alle</a> · <a href="#" onclick="updAll(false);return false">keine</a></div>
