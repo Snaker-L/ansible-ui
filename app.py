@@ -2764,7 +2764,7 @@ MACHINE = """{% extends "base.html" %}{% block title %}{{ (h.display or name) if
 <input type="hidden" name="delete" value="1"><button class="danger">Maschine löschen</button></form>{% endif %}</div>{% endif %}
 {% if name and runs %}<h2>Letzte Läufe</h2><table><tr><th>Start</th><th>Lauf</th><th>Status</th></tr>
 {% for r in runs %}<tr><td class="small">{{r.start}}</td><td><a href="/laeufe/{{r.id}}">{{r.title}}</a></td>
-<td class="{{ 'st-ok' if r.status=='ok' else ('st-run' if r.status=='laeuft' else 'st-err') }}">{{r.status}}</td></tr>{% endfor %}</table>{% endif %}
+<td class="{{ 'st-ok' if r.status=='ok' else ('st-run' if r.status=='laeuft' else 'st-err') }}">{{ 'läuft' if r.status=='laeuft' else r.status }}</td></tr>{% endfor %}</table>{% endif %}
 {% if f %}<h2>Alle Device-Infos</h2><details><summary class="mut">anzeigen ({{ f|length }} Einträge)</summary><pre>{{ facts_json }}</pre></details>{% endif %}
 {% endblock %}"""
 
@@ -2790,13 +2790,13 @@ RUNS = """{% extends "base.html" %}{% block title %}Läufe{% endblock %}
 {% block head %}<meta http-equiv="refresh" content="10">{% endblock %}{% block body %}
 <h1>Läufe</h1><table><tr><th>Start</th><th>Ende</th><th>Lauf</th><th>Ziel</th><th>Status</th></tr>
 {% for r in runs %}<tr><td class="small">{{r.start}}</td><td class="small">{{r.end or ''}}</td><td><a href="/laeufe/{{r.id}}">{{r.title}}</a></td><td>{{r.target}}</td>
-<td class="{{ 'st-ok' if r.status=='ok' else ('st-run' if r.status=='laeuft' else 'st-err') }}">{{r.status}}</td></tr>
+<td class="{{ 'st-ok' if r.status=='ok' else ('st-run' if r.status=='laeuft' else 'st-err') }}">{{ 'läuft' if r.status=='laeuft' else r.status }}</td></tr>
 {% else %}<tr><td colspan="5" class="mut">noch keine Läufe</td></tr>{% endfor %}</table>{% endblock %}"""
 
 RUN = """{% extends "base.html" %}{% block title %}Lauf{% endblock %}
 {% block head %}{% if r.status=='laeuft' %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}{% block body %}
 <h1>{{ r.title }}</h1><p class="mut">Start {{ r.start }}{% if r.end %} · Ende {{ r.end }}{% endif %} · Status
-<b class="{{ 'st-ok' if r.status=='ok' else ('st-run' if r.status=='laeuft' else 'st-err') }}">{{ r.status }}</b></p>
+<b class="{{ 'st-ok' if r.status=='ok' else ('st-run' if r.status=='laeuft' else 'st-err') }}">{{ 'läuft' if r.status=='laeuft' else r.status }}</b></p>
 <pre>{{ text or '…' }}</pre><p>{% if back %}<a class="btn acc" href="/maschine/{{ back.name }}">Zurück zu {{ back.display or back.name }}</a> {% endif %}<a class="btn" href="/">Zur Maschinenliste</a></p>{% endblock %}"""
 
 SETTINGS = """{% extends "base.html" %}{% block title %}Einstellungen{% endblock %}{% block body %}
