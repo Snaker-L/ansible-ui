@@ -13,6 +13,7 @@ Daten (Volume /data):
 """
 import datetime
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -1806,6 +1807,17 @@ def settings():
             save("settings.json", s)
         flash("Update-Prüfung gespeichert.", "ok")
         return redirect(url_for("settings") + "#updates")
+    if request.method == "POST" and request.form.get("form") == "prep":
+        nets, bad = parse_cidrs(request.form.get("fw_net"))
+        if bad:
+            flash("Ungültige Netze: " + ", ".join(bad) + " (Format z. B. 192.168.1.0/24)", "err")
+        else:
+            with LOCK:
+                s = settings_data()
+                s["fw_net"] = ", ".join(nets)
+                save("settings.json", s)
+            flash("Netz für die Freigaben gespeichert.", "ok")
+        return redirect(url_for("settings") + "#vorbereiten")
     if request.method == "POST" and request.form.get("form") == "location":
         location_action(request.form)
         return redirect(url_for("settings") + "#standorte")
@@ -1829,6 +1841,7 @@ def settings():
     except (OSError, subprocess.TimeoutExpired):
         ver = []
     sec = profiles_data()
+    conf = settings_data()
     used = {}
     for h in hosts():
         pr = profile_for(h, sec)
@@ -1838,7 +1851,34 @@ def settings():
     for h in hosts():
         loc_count[h.get("location")] = loc_count.get(h.get("location"), 0) + 1
     return render_template("settings.html", pub=pub, sec=sec, ver=ver[0] if ver else "", auth=load("auth.json", {}),
-                           used=used, label=profile_label, locs=locations(), loc_count=loc_count, conf=settings_data())
+                           used=used, label=profile_label, locs=locations(), loc_count=loc_count, conf=conf,
+                           fwn=fw_nets(conf), fwn_list=[x.strip() for x in fw_nets(conf).split(",")])
+
+
+def parse_cidrs(raw):
+    """Komma-/Leerzeichen-getrennte IPv4-Netze (CIDR) pruefen und normalisieren."""
+    ok, bad = [], []
+    for x in [x.strip() for x in re.split(r"[,\s;]+", raw or "") if x.strip()]:
+        try:
+            ok.append(str(ipaddress.ip_network(x, strict=False)))
+        except ValueError:
+            bad.append(x)
+    return ok, bad
+
+
+def fw_nets(conf):
+    """Netze fuer die Firewall-Freigaben: Einstellung, sonst Praefixe des ersten Standorts, sonst Beispiel."""
+    if conf.get("fw_net"):
+        return conf["fw_net"]
+    out = []
+    for loc in locations()[:1]:
+        for pre in loc.get("nets", []):
+            parts = [x for x in pre.split(".") if x]
+            if 1 <= len(parts) <= 4 and all(x.isdigit() for x in parts):
+                net = ".".join(parts + ["0"] * (4 - len(parts))) + "/" + str(8 * len(parts))
+                if net not in out:
+                    out.append(net)
+    return ", ".join(out) or "192.168.1.0/24"
 
 
 def parse_nets(raw):
@@ -2645,8 +2685,8 @@ function rbSubmit(f){var sts=rbStages();if(!sts.length)return false;
 <h2 style="margin:0 0 4px;color:var(--text)">Updates installieren</h2>
 <div class="small mut" style="margin-bottom:8px">Maschinen mit offenen Updates{{ ' (aktueller Filter)' if (grp or loc or stat or updf) }} · ohne Neustart · <a href="#" onclick="updAll(true);return false">alle</a> · <a href="#" onclick="updAll(false);return false">keine</a></div>
 <div style="max-height:52vh;overflow:auto;border:1px solid var(--line);border-radius:8px"><table class="dlg">
-{% for r in upd_rows %}{% set u = r.st.upd %}<tr><td style="width:1%"><input type="checkbox" class="updh" name="host" value="{{ r.name }}" id="uh-{{ loop.index }}" {{ '' if r.no_mass else 'checked' }} onchange="updCount()"></td>
-<td><label for="uh-{{ loop.index }}" class="plain"><b>{{ r.display or r.name }}</b>{% if r.no_mass %} <span class="st-warn small">nur einzeln</span>{% endif %}</label><div class="mut small">&#128205; {{ r.location }}</div></td>
+{% for r in upd_rows %}{% set u = r.st.upd %}<tr><td style="width:1%"><input type="checkbox" class="updh" name="host" value="{{ r.name }}" id="uh-{{ loop.index }}" {{ 'disabled' if r.run else ('' if r.no_mass else 'checked') }} onchange="updCount()"></td>
+<td><label for="uh-{{ loop.index }}" class="plain"><b>{{ r.display or r.name }}</b>{% if r.run %} <a class="st-run small" href="/laeufe/{{ r.run.id }}" title="seit {{ r.run.start[11:16] }}">{{ 'Update läuft bereits' if r.run.what == 'Update läuft' else r.run.what }}</a>{% elif r.no_mass %} <span class="st-warn small">nur einzeln</span>{% endif %}</label><div class="mut small">&#128205; {{ r.location }}</div></td>
 <td><span class="tag {{ r.group }}">{{ r.group }}</span></td>
 <td class="small" style="white-space:nowrap"><span class="st-warn">{{ u.count }} Update{{ 's' if u.count != 1 }}</span>{% if u.security %}<div class="st-err">{{ u.security }} Sicherheit</div>{% endif %}</td></tr>{% endfor %}
 </table></div>
@@ -2657,7 +2697,7 @@ function rbSubmit(f){var sts=rbStages();if(!sts.length)return false;
 <p style="text-align:right;margin:12px 0 0"><button type="button" onclick="this.closest('dialog').close()">Abbrechen</button> <button class="acc" id="upd-go">Installieren</button></p>
 </form></dialog>
 <script>
-function updAll(v){document.querySelectorAll('.updh').forEach(function(c){c.checked=v});updCount()}
+function updAll(v){document.querySelectorAll('.updh:not(:disabled)').forEach(function(c){c.checked=v});updCount()}
 function updCount(){var n=document.querySelectorAll('.updh:checked').length,pl=document.getElementById('upd-plan').checked,b=document.getElementById('upd-go');
  b.textContent=(pl?'Planen':'Jetzt installieren')+' ('+n+')';b.disabled=!n}
 function updSubmit(f){var n=f.querySelectorAll('.updh:checked').length;if(!n)return false;
@@ -2804,6 +2844,50 @@ SETTINGS = """{% extends "base.html" %}{% block title %}Einstellungen{% endblock
 <div class="card"><h2 style="margin-top:0">SSH-Schlüssel für Linux</h2>
 <p class="mut">Diesen öffentlichen Schlüssel auf jeder Linux-Maschine beim jeweiligen Benutzer in <code>~/.ssh/authorized_keys</code> eintragen:</p>
 <pre>{{ pub }}</pre></div>
+<div class="card" id="vorbereiten"><h2 style="margin-top:0">Maschine vorbereiten</h2>
+<p class="mut small">Einmal auf jeder neuen Maschine ausführen, bevor sie hier angelegt wird. Die Freigaben gelten nur für das eigene Subnetz und die Netze unten – dort muss die Adresse enthalten sein, von der die Ansible-UI zugreift.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="form" value="prep"><div class="grid">
+<div style="grid-column:span 2"><label>Netze für die Freigaben (CIDR, Komma-getrennt)</label><input name="fw_net" value="{{ conf.fw_net or '' }}" placeholder="{{ fwn }}"></div>
+<div><button>Speichern</button></div></div></form>
+{% if not conf.fw_net %}<p class="small st-warn">Noch nicht festgelegt – unten steht vorläufig „{{ fwn }}“{{ ' (aus dem ersten Standort)' if fwn != '192.168.1.0/24' }}.</p>{% endif %}
+<details><summary><b>Windows</b> – PowerShell als Administrator</summary>
+<p class="small">1. Ping freischalten:</p>
+<pre class="cp">New-NetFirewallRule -DisplayName "Ping (Ansible)" -Direction Inbound -Protocol ICMPv4 -IcmpType 8 -RemoteAddress LocalSubnet, {{ fwn }} -Action Allow -Profile Any</pre>
+<p class="small">2. WinRM (Port 5985 für Ansible) freischalten:</p>
+<pre class="cp">New-NetFirewallRule -DisplayName "WinRM (Ansible)" -Direction Inbound -Protocol TCP -LocalPort 5985 -RemoteAddress LocalSubnet, {{ fwn }} -Action Allow -Profile Any</pre>
+<p class="small">3. WinRM selbst einschalten (einmalig), damit Ansible sich anmelden kann:</p>
+<pre class="cp">Enable-PSRemoting -Force -SkipNetworkProfileCheck</pre>
+<p class="small">4. Nur bei einem <i>lokalen</i> Konto, das nicht das eingebaute „Administrator“ ist (bei Domänenkonten nicht nötig) – sonst lehnt Windows die Anmeldung über das Netz mit eingeschränkten Rechten ab:</p>
+<pre class="cp">New-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System" -Name LocalAccountTokenFilterPolicy -Value 1 -PropertyType DWord -Force</pre>
+<p class="mut small">Das Konto muss lokaler Administrator sein. Benutzer und Passwort kommen in ein Windows-Zugangsprofil (Verfahren meist <code>ntlm</code>, im Domänennetz auch <code>kerberos</code>). Test: Maschine anlegen und „Ping“.</p>
+</details>
+<details><summary><b>Linux</b> – als root bzw. mit <code>sudo</code></summary>
+<p class="small">1. SSH-Server, Python und sudo installieren und SSH starten:</p>
+<pre class="cp"># Debian / Ubuntu / Raspberry Pi OS
+apt update && apt install -y openssh-server python3 sudo && systemctl enable --now ssh
+# Fedora / RHEL / Rocky / Alma
+dnf install -y openssh-server python3 sudo && systemctl enable --now sshd
+# openSUSE
+zypper install -y openssh python3 sudo && systemctl enable --now sshd</pre>
+<p class="small">2. Benutzer für Ansible sudo erlauben (Benutzername anpassen; Debian/Ubuntu Gruppe <code>sudo</code>, Fedora/RHEL/openSUSE <code>wheel</code>):</p>
+<pre class="cp">usermod -aG sudo BENUTZER</pre>
+<p class="small">3. Den SSH-Schlüssel von oben eintragen – <b>als dieser Benutzer</b> ausführen:</p>
+<pre class="cp">mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '{{ pub }}' &gt;&gt; ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys</pre>
+<p class="small">4. Nur falls eine Firewall aktiv ist – SSH freigeben (Ping ist dort meist schon erlaubt):</p>
+<pre class="cp"># ufw (Debian / Ubuntu)
+{% for n in fwn_list %}ufw allow from {{ n }} to any port 22 proto tcp
+{% endfor %}# firewalld (Fedora / RHEL / openSUSE)
+{% for n in fwn_list %}firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="{{ n }}" service name="ssh" accept'
+{% endfor %}firewall-cmd --reload</pre>
+<p class="mut small">Im Zugangsprofil „sudo“ wählen und das sudo-Passwort (= Login-Passwort des Benutzers) eintragen. Geht nur <code>su</code> (Root-Passwort), stattdessen „su“ wählen. Test: Maschine anlegen und „Ping“.</p>
+</details>
+<script>
+document.querySelectorAll('pre.cp').forEach(function(p){var b=document.createElement('button');b.type='button';b.className='small';b.textContent='Kopieren';b.style.cssText='float:right;margin:-4px -4px 0 8px';
+b.onclick=function(){var ok=function(){b.textContent='Kopiert ✓';setTimeout(function(){b.textContent='Kopieren'},1500)};
+var old=function(){var a=document.createElement('textarea');a.value=p.dataset.t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();ok()};
+if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(p.dataset.t).then(ok,old)}else{old()}};
+p.dataset.t=p.textContent;p.insertBefore(b,p.firstChild)})
+</script></div>
 <div class="card"><h2 style="margin-top:0">Zugangsprofile</h2>
 <p class="mut small">Ein Profil beschreibt, wie Ansible sich anmeldet und wie es Rechte bekommt (z. B. Anmeldung als Benutzer, dann <code>su</code> zu root). Jede Maschine nutzt das Standardprofil ihrer Gruppe oder ein eigenes (auf ihrer Detailseite).</p>
 <table><tr><th>Name</th><th>Typ</th><th>Zugang</th><th>Passwörter</th><th>Verwendet von</th><th></th></tr>
