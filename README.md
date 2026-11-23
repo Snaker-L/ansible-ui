@@ -54,14 +54,23 @@ gedacht für Heimnetz und kleine Umgebungen mit Linux- und Windows-Rechnern.
 
 ## Starten
 
+Fertiges Image (amd64 und arm64) aus den GitHub-Releases:
+
 ```sh
-docker build -t ansible-ui:local .
 docker run -d --name ansible-ui -p 3000:3000 \
   -e ADMIN_PASSWORD='bitte-aendern' \
   -e SECRET_KEY="$(openssl rand -hex 32)" \
+  -e ANSIBLE_UI_UPDATE_REPO=Snaker-L/ansible-ui \
   -v ansible_ui_data:/data \
-  ansible-ui:local
+  ghcr.io/snaker-l/ansible-ui:latest
 ```
+
+Update: `docker pull ghcr.io/snaker-l/ansible-ui:latest` und den Container neu erstellen (in Portainer:
+Container › *Recreate* mit *Re-pull image*). Die Daten bleiben im Volume `/data`.
+Selbst bauen geht weiterhin mit `docker build -t ansible-ui:local .`.
+
+Neue Version veröffentlichen: `__version__` in `app.py` erhöhen, committen und den Tag `v<version>` pushen.
+GitHub Actions baut dann das Image und legt das Release an.
 
 Danach `http://<host>:3000` öffnen und mit `admin` und dem Start-Passwort anmelden.
 Das Passwort lässt sich unter *Einstellungen* ändern (wird nur als Hash gespeichert).
@@ -73,6 +82,8 @@ Das Passwort lässt sich unter *Einstellungen* ändern (wird nur als Hash gespei
 | `ADMIN_USER`     | Benutzername                                       | `admin`  |
 | `ADMIN_PASSWORD` | Start-Passwort (gilt, bis es in der UI geändert wird) | –     |
 | `SECRET_KEY`     | Schlüssel für Sitzungs-Cookies                      | zufällig bei jedem Start |
+| `ANSIBLE_UI_UPDATE_REPO` | GitHub-Repo für den Update-Hinweis oben rechts (z. B. `Snaker-L/ansible-ui`) | – (keine Prüfung) |
+| `ANSIBLE_UI_UPDATE_TOKEN` | nur bei privatem Repo: Token mit Leserecht | – |
 | `DATA_DIR`       | Datenverzeichnis                                   | `/data`  |
 
 ### Daten (`/data`)

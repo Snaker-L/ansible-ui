@@ -1,5 +1,6 @@
 # Ansible-UI: Ansible + kleine deutsche Weboberflaeche mit Maschinenliste
-# Bauen: docker build -t ansible-ui:local .
+# Fertiges Image: ghcr.io/snaker-l/ansible-ui:latest (GitHub Actions, .github/workflows/release.yml)
+# Selbst bauen: docker build -t ansible-ui:local .
 FROM python:3.13-slim
 
 RUN apt-get update \

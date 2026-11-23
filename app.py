@@ -37,7 +37,12 @@ from flask import Flask, abort, flash, has_request_context, redirect, render_tem
 from werkzeug.security import check_password_hash, generate_password_hash
 from jinja2 import DictLoader
 
+__version__ = "1.0.0"
+
 DATA = os.environ.get("DATA_DIR", "/data")
+# Update-Hinweis: GitHub-Repo "besitzer/name" (leer = keine Pruefung), optional Token fuer private Repos
+UPDATE_REPO = os.environ.get("ANSIBLE_UI_UPDATE_REPO", "").strip()
+UPDATE_TOKEN = os.environ.get("ANSIBLE_UI_UPDATE_TOKEN", "").strip()
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
@@ -994,12 +999,47 @@ def login_required(fn):
     return wrapper
 
 
+_UPD = {"t": 0.0, "latest": "", "url": ""}
+
+
+def _ver_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3])
+
+
+def update_info():
+    """Neueste Version auf GitHub (Releases), hoechstens alle 6 h abgefragt, im Hintergrund."""
+    if not UPDATE_REPO:
+        return {}
+    now = time.time()
+    if now - _UPD["t"] > 6 * 3600:
+        _UPD["t"] = now
+
+        def fetch():
+            import urllib.request
+            req = urllib.request.Request(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+                                         headers={"Accept": "application/vnd.github+json", "User-Agent": "ansible-ui"})
+            if UPDATE_TOKEN:
+                req.add_header("Authorization", f"Bearer {UPDATE_TOKEN}")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    d = json.load(r)
+                _UPD.update(latest=str(d.get("tag_name", "")).lstrip("v"), url=d.get("html_url", ""))
+            except (OSError, ValueError):
+                pass
+        threading.Thread(target=fetch, daemon=True).start()
+    if _UPD["latest"] and _ver_tuple(_UPD["latest"]) > _ver_tuple(__version__):
+        return {"latest": _UPD["latest"], "url": _UPD["url"]}
+    return {}
+
+
 @app.context_processor
 def ctx():
     if not session.get("user"):
-        return {"csrf": "", "groups": GROUPS, "locations": [], "admin": False, "can_run": False, "can": {k: False for k in ACTIONS}}
-    return {"csrf": session.get("csrf", ""), "groups": GROUPS, "locations": visible_locs(), "admin": is_admin(),
-            "can_run": can_run(), "can": can_map()}
+        return {"csrf": "", "groups": GROUPS, "locations": [], "admin": False, "can_run": False, "can": {k: False for k in ACTIONS},
+                "version": __version__, "upd": {}}
+    adm = is_admin()
+    return {"csrf": session.get("csrf", ""), "groups": GROUPS, "locations": visible_locs(), "admin": adm,
+            "can_run": can_run(), "can": can_map(), "version": __version__, "upd": update_info() if adm else {}}
 
 
 def check_admin(pw):
@@ -2610,7 +2650,7 @@ input[type=checkbox],input[type=radio]{width:auto}
 </style></head><body>
 {% if session.user %}<header><b>&#9881; Ansible-UI</b><nav>
 <a href="/">Maschinen</a>{% if admin %}<a href="/playbooks">Playbooks</a>{% endif %}<a href="/laeufe">Läufe</a>{% if admin %}<a href="/einstellungen">Einstellungen</a><a href="/benutzer">Benutzer</a>{% endif %}</nav>
-<span class="sp"></span><span class="mut">{{ session.user }}{% if not admin %} <a href="/passwort" class="small">Passwort</a>{% endif %}</span><a href="/logout">Abmelden</a></header>{% endif %}
+<span class="sp"></span>{% if upd %}<a href="{{ upd.url }}" target="_blank" rel="noopener" class="small" style="color:var(--warn)">Update {{ upd.latest }} verfügbar</a>{% endif %}<span class="mut small" title="Ansible-UI-Version">v{{ version }}</span><span class="mut">{{ session.user }}{% if not admin %} <a href="/passwort" class="small">Passwort</a>{% endif %}</span><a href="/logout">Abmelden</a></header>{% endif %}
 <main>{% for cat,m in get_flashed_messages(with_categories=true) %}<div class="flash {{cat}}">{{m}}</div>{% endfor %}
 {% block body %}{% endblock %}</main></body></html>"""
 
