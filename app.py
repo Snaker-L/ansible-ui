@@ -37,7 +37,7 @@ from flask import Flask, abort, flash, has_request_context, redirect, render_tem
 from werkzeug.security import check_password_hash, generate_password_hash
 from jinja2 import DictLoader
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 DATA = os.environ.get("DATA_DIR", "/data")
 # Update-Hinweis: GitHub-Repo "besitzer/name" (leer = keine Pruefung), optional Token fuer private Repos
@@ -1379,7 +1379,19 @@ def run_reason(rid, name):
         return ""
     line = None
     for mm in re.finditer(r"(?:fatal|unreachable): \[" + re.escape(name) + r"\].*", text):
-        line = text[mm.start():mm.start() + 3000]  # Ausgabe kann mehrzeilig sein ("FAILED! => {" ...)
+        # Ausgabe kann mehrzeilig sein ("FAILED! => {" ...): nur eingerueckte Folgezeilen bis zur schliessenden "}"
+        # gehoeren dazu, sonst landen Meldungen anderer Maschinen/Tasks im Grund
+        rows = text[mm.start():mm.start() + 3000].split("\n")
+        block = [rows[0]]
+        for r in rows[1:]:
+            if r.startswith((" ", "\t")):
+                block.append(r)
+            elif r.startswith("}"):
+                block.append(r)
+                break
+            else:
+                break
+        line = "\n".join(block)
     if line:
         parts = [x for k in ("module_stdout", "msg") for x in re.findall(r'"' + k + r'": "(.*?)(?<!\\)"', line)]
         return explain(" ".join(x.replace("\\r", " ").replace("\\n", " ") for x in parts) or line)[:140]
